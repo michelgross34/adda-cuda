@@ -33,14 +33,18 @@ endif
 ROOT      := ..
 SRC       := $(ROOT)/src/cudamatvec_backend.cu
 DEF       := $(ROOT)/src/cudamatvec_backend.def
+DEF_SINGLE:= $(ROOT)/src/cudamatvec_backend_single.def
 INCLUDE   := $(ROOT)/src
 DLL       := adda_cuda_backend.dll
 MSVCLIB   := adda_cuda_backend.lib
 GNULIB    := libadda_cuda_backend.a
+DLL_SINGLE:= adda_cuda_backend_single.dll
+MSVCLIB_SINGLE:= adda_cuda_backend_single.lib
+GNULIB_SINGLE:= libadda_cuda_backend_single.a
 
 .PHONY: all clean info
 
-all: $(DLL) $(GNULIB)
+all: $(DLL) $(GNULIB) $(DLL_SINGLE) $(GNULIB_SINGLE)
 
 $(DLL): $(SRC) $(DEF) $(ROOT)/src/cudamatvec_backend.h
 	$(NVCC) -std=c++14 --shared -O3 $(ARCH_FLAG) -I"$(INCLUDE)" "$(SRC)" -lcufft -lcublas -Xlinker "/DEF:$(DEF)" -Xlinker "/IMPLIB:$(MSVCLIB)" -o "$(DLL)"
@@ -48,10 +52,18 @@ $(DLL): $(SRC) $(DEF) $(ROOT)/src/cudamatvec_backend.h
 $(GNULIB): $(DLL) $(DEF)
 	$(DLLTOOL) --def "$(DEF)" --dllname "$(DLL)" --output-lib "$(GNULIB)"
 
+$(DLL_SINGLE): $(SRC) $(DEF_SINGLE) $(ROOT)/src/cudamatvec_backend.h
+	$(NVCC) -std=c++14 --shared -O3 $(ARCH_FLAG) -DADDA_CUDA_SINGLE_BACKEND -I"$(INCLUDE)" "$(SRC)" -lcufft -lcublas -Xlinker "/DEF:$(DEF_SINGLE)" -Xlinker "/IMPLIB:$(MSVCLIB_SINGLE)" -o "$(DLL_SINGLE)"
+
+$(GNULIB_SINGLE): $(DLL_SINGLE) $(DEF_SINGLE)
+	$(DLLTOOL) --def "$(DEF_SINGLE)" --dllname "$(DLL_SINGLE)" --output-lib "$(GNULIB_SINGLE)"
+
 info:
-	@echo CUDA DLL    : $(DLL)
-	@echo MinGW import: $(GNULIB)
+	@echo CUDA double DLL    : $(DLL)
+	@echo MinGW double import: $(GNULIB)
+	@echo CUDA float32 DLL   : $(DLL_SINGLE)
+	@echo MinGW float32 import: $(GNULIB_SINGLE)
 	@echo CUDA arch   : $(ARCH_LABEL)
 
 clean:
-	-del /Q "$(DLL)" "$(MSVCLIB)" "$(GNULIB)" 2>NUL
+	-del /Q "$(DLL)" "$(MSVCLIB)" "$(GNULIB)" "$(DLL_SINGLE)" "$(MSVCLIB_SINGLE)" "$(GNULIB_SINGLE)" 2>NUL

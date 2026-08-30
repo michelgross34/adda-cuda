@@ -47,7 +47,7 @@
 
 // defined and initialized in calculator.c
 extern doublecomplex *rvec; // can't be declared restrict due to SwapPointers
-extern doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict vec4,* restrict Avecbuffer;
+extern doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict vec4,* restrict vec5,* restrict vec6,* restrict vec7,* restrict Avecbuffer;
 // defined and initialized in fft.c
 #if !defined(OPENCL) && !defined(SPARSE)
 extern doublecomplex * restrict Xmatrix; // used as storage for arrays in WKB init field
@@ -57,6 +57,8 @@ extern const double iter_eps;
 extern const enum init_field InitField;
 extern const char *infi_fnameY,*infi_fnameX;
 extern const bool recalc_resid;
+extern const bool reliable_resid;
+extern const bool reliable_resid_force_restart;
 extern const enum chpoint chp_type;
 extern const time_t chp_time;
 extern const char *chp_dir;
@@ -83,6 +85,8 @@ static bool chp_exit;      // checkpoint occurred - exit
 static bool complete;      // complete iteration was performed (not stopped in the middle)
 	// whether matrix-vector product computed during initialization can be reused at first iteration
 static bool matvec_ready;
+static bool gp2_restart_request; // request PHASE_INIT to rebuild GPBiCGStab(2) after a true-residual check
+static bool bcgs2_restart_request; // request PHASE_INIT to rebuild BiCGStab(2)/BCGS2 after a true-residual check
 typedef struct // data for checkpoints
 {
 	void *ptr; // pointer to the data
@@ -112,8 +116,11 @@ static doublecomplex dumb;
 ITER_FUNC(BCGS2);
 ITER_FUNC(BiCG_CS);
 ITER_FUNC(BiCGStab);
+ITER_FUNC(BiCGStab4);
 ITER_FUNC(CGNR);
 ITER_FUNC(CSYM);
+ITER_FUNC(GPBiCGStab2);
+ITER_FUNC(GPBiCGStab4);
 ITER_FUNC(QMR_CS);
 ITER_FUNC(QMR_CS_2);
 /* TO ADD NEW ITERATIVE SOLVER
@@ -122,11 +129,14 @@ ITER_FUNC(QMR_CS_2);
  */
 
 static const struct iter_params_struct params[]={
-	{IT_BCGS2,15000,2,1,BCGS2},
+	{IT_BCGS2,15000,3,1,BCGS2},
 	{IT_BICG_CS,50000,1,0,BiCG_CS},
 	{IT_BICGSTAB,30000,3,3,BiCGStab},
+	{IT_BICGSTAB4,30000,3,9,BiCGStab4},
 	{IT_CGNR,10,1,0,CGNR},
 	{IT_CSYM,10,6,2,CSYM},
+	{IT_GPBICGSTAB2,30000,1,7,GPBiCGStab2},
+	{IT_GPBICGSTAB4,30000,0,11,GPBiCGStab4},
 	{IT_QMR_CS,50000,8,3,QMR_CS},
 	{IT_QMR_CS_2,50000,5,2,QMR_CS_2}
 	/* TO ADD NEW ITERATIVE SOLVER
@@ -485,13 +495,122 @@ static double ResidualNorm2(doublecomplex * restrict x,doublecomplex * restrict 
 # define IT_LINCOMB1_CMPLX_CONJ    nLinComb1_cmplx_conj
 #endif
 
+#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+#define RELIABLE_GAP_TOL 1E-3
+
+typedef struct
+{
+	double true_norm2;
+	double gap_norm2;
+	double gap;
+	bool restart;
+	bool forced_restart;
+	bool true_converged;
+	bool false_convergence;
+} reliable_residual_result;
+
+static reliable_residual_result ReliableResidualCheck(const enum iter method,const double recursive_norm2)
+/* Non-destructive reliable-residual check for CUDA float32 BiCGStab(2)/BCGS2
+ * and GPBiCGStab(2).
+ *
+ *  1. Compute Ax into the already resident Avecbuffer.
+ *  2. Download Ax and the current recursive residual r.
+ *  3. In FP64 arithmetic form, element by element,
+ *         r_true = sqrt(C) Einc - Ax
+ *     and the vector residual gap
+ *         ||r_true-r_recursive|| / ||r_true||.
+ *  4. If the gap is small, leave every GPU Krylov vector untouched and continue.
+ *  5. Restart only when the vector gap exceeds RELIABLE_GAP_TOL, when
+ *     recursive convergence is not confirmed by the true residual, or when
+ *     -reliable_resid_force_restart is active.
+ *
+ * The forced-restart option is deliberately a validation tool. It still avoids
+ * restarting when r_true already satisfies the stopping criterion.
+ *
+ * No additional resident GPU vector and no additional full-size host vector is
+ * needed. Avecbuffer contains Ax on the host, while rvec contains the downloaded
+ * recursive residual. If a restart is required, rvec is overwritten by r_true
+ * in a second pass and uploaded. */
+{
+	reliable_residual_result result={0,0,0,false,false,false,false};
+	TIME_TYPE host_comm=0;
+	register size_t i,k;
+	double true_sum=0,gap_sum=0;
+
+	IT_MATVEC(xvec,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+	CudaIterDownloadOne(Avecbuffer);
+	CudaIterDownloadOne(rvec);
+
+	/* Promote all operands before forming the true residual and the gap. This
+	 * does not make the MatVec itself FP64, but avoids adding another FP32
+	 * accumulation error to the diagnostic. */
+	LARGE_LOOP;
+	for (i=0,k=0;i<local_nvoid_Ndip;i++,k+=3) {
+		const doublecomplex * restrict val=cc_sqrt[material[i]];
+		int j;
+		for (j=0;j<3;j++) {
+			const double complex b=(double complex)val[j]*(double complex)Einc[k+j];
+			const double complex ax=(double complex)Avecbuffer[k+j];
+			const double complex rt=b-ax;
+			const double complex rr=(double complex)rvec[k+j];
+			const double complex dg=rt-rr;
+			true_sum+=creal(rt)*creal(rt)+cimag(rt)*cimag(rt);
+			gap_sum+=creal(dg)*creal(dg)+cimag(dg)*cimag(dg);
+		}
+	}
+	MyInnerProduct(&true_sum,double_type,1,&host_comm);
+	MyInnerProduct(&gap_sum,double_type,1,&host_comm);
+	Timing_OneIterComm+=host_comm;
+	result.true_norm2=true_sum;
+	result.gap_norm2=gap_sum;
+	result.gap=(true_sum>0 ? sqrt(MAX(0.0,gap_sum/true_sum)) : (gap_sum>0 ? HUGE_VAL : 0));
+	result.true_converged=(true_sum<=epsB);
+	result.false_convergence=(recursive_norm2<=epsB && !result.true_converged);
+	result.forced_restart=(reliable_resid_force_restart && !result.true_converged);
+	result.restart=(!result.true_converged &&
+		(result.forced_restart || result.gap>=RELIABLE_GAP_TOL || result.false_convergence));
+
+	if (result.restart) {
+		/* Re-form r_true into the already allocated host rvec, upload only that
+		 * vector, retain x, and rebuild the selected L=2 Krylov recurrence. */
+		LARGE_LOOP;
+		for (i=0,k=0;i<local_nvoid_Ndip;i++,k+=3) {
+			const doublecomplex * restrict val=cc_sqrt[material[i]];
+			int j;
+			for (j=0;j<3;j++) {
+				const double complex b=(double complex)val[j]*(double complex)Einc[k+j];
+				const double complex ax=(double complex)Avecbuffer[k+j];
+				rvec[k+j]=(doublecomplex)(b-ax);
+			}
+		}
+		CudaIterUploadOne(rvec);
+		matvec_ready=false;
+		if (method==IT_GPBICGSTAB2) {
+			gp2_restart_request=true;
+			GPBiCGStab2(PHASE_INIT);
+			gp2_restart_request=false;
+		}
+		else if (method==IT_BCGS2) {
+			bcgs2_restart_request=true;
+			BCGS2(PHASE_INIT);
+			bcgs2_restart_request=false;
+		}
+		else LogError(ONE_POS,"Reliable residual restart requested for unsupported iterative solver");
+	}
+
+	return result;
+}
+#endif
+
 ITER_FUNC(BCGS2)
 /* Enhanced Bi-CGStab(2) method.
  * Based on the code by M.A. Botchev and D.R. Fokkema - http://www.math.uu.nl/people/vorst/zbcg2.f90 and
  * D. R. Fokkema, "Enhanced implementation of BiCGstab(l) for solving linear systems of equations," Preprint 976,
  * Department of Mathematics, Utrecht University (1996).
  *
- * "Reliable update part" was removed, since tests using '-recalc_resid' show that it is (almost) never needed.
+ * The original ADDA port removed the Botchev/Fokkema "reliable update part", since double-precision tests using
+ * '-recalc_resid' showed it was almost never needed. For CUDA float32, ADDA now provides an external periodic
+ * true-residual monitor/restart through '-reliable_resid'; it is deliberately kept outside this recurrence.
  *
  * For l=1, the method is equivalent to BiCGStab, rewritten through 2-term recurrences (as QMR2 is equivalent to QMR),
  * so we use l=2 here. In many cases one iteration of this method is similar to two iterations of BiCGStab, but overall
@@ -511,6 +630,7 @@ ITER_FUNC(BCGS2)
 	static int i,j;
 	static doublecomplex alpha,beta,omega,rho0,rho1,sigma,varrho,hatgamma,temp1;
 	static double kappa0,kappal,dtmp;
+	static bool fresh_start;
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -528,7 +648,9 @@ ITER_FUNC(BCGS2)
 			// initialize data structure for checkpoints
 			scalars[0].ptr=&rho0;
 			scalars[1].ptr=&alpha;
+			scalars[2].ptr=&fresh_start;
 			scalars[0].size=scalars[1].size=sizeof(doublecomplex);
+			scalars[2].size=sizeof(bool);
 			vectors[0].ptr=vec2; // u[0]
 			vectors[0].size=sizeof(doublecomplex);
 #ifdef __INTEL_COMPILER // workaround for issue 286
@@ -540,9 +662,10 @@ ITER_FUNC(BCGS2)
 #endif
 			return;
 		case PHASE_INIT:
-			if (!load_chpoint) {
+			if (!load_chpoint || bcgs2_restart_request) {
 				IT_COPY(pvec,rvec); // (pvec = r~0) = r0
 				rho0=-1;
+				fresh_start=true;
 			}
 			return;
 		case PHASE_ITER:
@@ -550,7 +673,7 @@ ITER_FUNC(BCGS2)
 			for (j=0;j<LL;j++) {
 				rho1=IT_DOT(r[j],pvec,&Timing_OneIterComm); // rho1 = r_j.r~0
 				// u_i = r_i - beta*u_i
-				if (niter==1 && j==0) IT_COPY(u[0],r[0]);
+				if (fresh_start && j==0) IT_COPY(u[0],r[0]);
 				else {
 					// test for zero rho0 (1/beta)
 					dtmp=cabs(rho0)/(cabs(rho1)*cabs(alpha)); // assume that rho1 is not exactly zero
@@ -635,6 +758,7 @@ ITER_FUNC(BCGS2)
 			for (i=0;i<=LL;i++) inprodRp1+=creal(zy0[i]*conj(y0[i]));
 			// rho0 = -omega*rho0; moved from the beginning of the iteration
 			rho0*=-omega;
+			fresh_start=false;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -642,6 +766,516 @@ ITER_FUNC(BCGS2)
 #undef LL
 #undef EPS1
 #undef EPS2
+
+//======================================================================================================================
+
+static bool GPSolveSmallN(double complex *a,double complex *b,const int n,const int ld)
+/* Pivoted Gaussian elimination for the small dense residual-minimization
+ * systems used by GPBiCGStab(L).  ld is the physical row stride of a. */
+{
+	int i,j,k,piv;
+	double best;
+	double complex tmp,factor;
+#define GP_A(ii,jj) a[(ii)*ld+(jj)]
+	for (k=0;k<n;k++) {
+		piv=k;
+		best=cabs(GP_A(k,k));
+		for (i=k+1;i<n;i++) if (cabs(GP_A(i,k))>best) { best=cabs(GP_A(i,k)); piv=i; }
+		if (best<1E-30) return false;
+		if (piv!=k) {
+			for (j=k;j<n;j++) { tmp=GP_A(k,j); GP_A(k,j)=GP_A(piv,j); GP_A(piv,j)=tmp; }
+			tmp=b[k]; b[k]=b[piv]; b[piv]=tmp;
+		}
+		for (i=k+1;i<n;i++) {
+			factor=GP_A(i,k)/GP_A(k,k);
+			GP_A(i,k)=0;
+			for (j=k+1;j<n;j++) GP_A(i,j)-=factor*GP_A(k,j);
+			b[i]-=factor*b[k];
+		}
+	}
+	for (i=n-1;i>=0;i--) {
+		tmp=b[i];
+		for (j=i+1;j<n;j++) tmp-=GP_A(i,j)*b[j];
+		if (cabs(GP_A(i,i))<1E-30) return false;
+		b[i]=tmp/GP_A(i,i);
+	}
+#undef GP_A
+	return true;
+}
+
+static double complex GPDot(const doublecomplex * restrict a,const doublecomplex * restrict b,TIME_TYPE *comm)
+/* IFDDA convention <a,b> = sum(conj(a)*b). ADDA nDotProd(a,b) is
+ * sum(a*conj(b)), hence the reversed operands.
+ *
+ * Precision policy:
+ * - CUDA float32: CudaIterDotProd64() performs the chunked FP64 cuBLAS reduction.
+ * - CPU float32: explicitly promote each complex value to double complex before
+ *   multiplication and accumulation. This keeps the GPBiCGStab(2) recurrence
+ *   scalars and its 2x2/3x3 minimizations in FP64 without changing the large
+ *   CPU vectors or MatVec, which remain float32.
+ * - CPU double: use the native ADDA dot product.
+ * This routine is also used by the CPU-only L=4 solvers. */
+{
+#ifdef ADDA_CUDA
+	return CudaIterDotProd64(b,a,comm);
+#elif defined(ADDA_SINGLE)
+	register size_t i;
+	register const size_t n=local_nRows;
+	double complex sum=0;
+	LARGE_LOOP;
+	for (i=0;i<n;i++) {
+		const double complex ad=(double)crealf(a[i]) + I*(double)cimagf(a[i]);
+		const double complex bd=(double)crealf(b[i]) + I*(double)cimagf(b[i]);
+		sum+=conj(ad)*bd;
+	}
+	/* In sequential CPU builds this is a no-op. In MPI builds cmplx_type is
+	 * represented by the historical double-complex reduction datatype. */
+	MyInnerProduct(&sum,cmplx_type,1,comm);
+	return sum;
+#else
+	return (double complex)IT_DOT(b,a,comm);
+#endif
+}
+
+static doublecomplex *cpu_l4_workspace=NULL;
+static size_t cpu_l4_workspace_rows=0,cpu_l4_workspace_vecs=0;
+
+static doublecomplex *EnsureCPUL4Workspace(const size_t nvec,const char *name)
+/* One contiguous CPU-only workspace is shared by the L=4 solvers. Only one
+ * iterative method is active at a time, and it is released at the end of
+ * IterativeSolver(), so no persistent CUDA ABI/global-vector changes are needed. */
+{
+	const size_t total=MultOverflow(nvec,local_nRows,ALL_POS,name);
+	if (cpu_l4_workspace!=NULL && (cpu_l4_workspace_rows!=local_nRows || cpu_l4_workspace_vecs<nvec)) {
+		Free_cVector(cpu_l4_workspace);
+		cpu_l4_workspace=NULL;
+		cpu_l4_workspace_rows=cpu_l4_workspace_vecs=0;
+	}
+	if (cpu_l4_workspace==NULL) {
+		cpu_l4_workspace=complexVector(total,ALL_POS,name);
+		cpu_l4_workspace_rows=local_nRows;
+		cpu_l4_workspace_vecs=nvec;
+	}
+	return cpu_l4_workspace;
+}
+
+static void FreeCPUL4Workspace(void)
+{
+	if (cpu_l4_workspace!=NULL) Free_cVector(cpu_l4_workspace);
+	cpu_l4_workspace=NULL;
+	cpu_l4_workspace_rows=cpu_l4_workspace_vecs=0;
+}
+
+//======================================================================================================================
+
+ITER_FUNC(BiCGStab4)
+/* BiCGStab(L), L=4, CPU implementation.  The BiCG part follows the
+ * Sleijpen/Fokkema BiCGStab(L) recurrence and the MR polynomial is formed by
+ * modified Gram-Schmidt.  The large vectors stay in the native ADDA precision;
+ * GPDot() promotes/accumulates scalar products in FP64 in adda_single.
+ *
+ * Workspace: the common rvec/u0=pvec plus 9 extra vectors:
+ *   r~0, r1..r4, u1..u4.  Thus the complete method uses the theoretical
+ *   2L+3=11 Krylov vectors including r0 and u0, without any double MatVec. */
+{
+#define BSL4_L 4
+#define BSL4_EPS 1E-30
+	static doublecomplex *r[BSL4_L+1],*u[BSL4_L+1],*rtilda;
+	static double complex rho,alpha,omega;
+	doublecomplex *base;
+	double complex rho1,beta,den,temp;
+	double complex tau[BSL4_L][BSL4_L],gamma_p[BSL4_L+1],gamma[BSL4_L+1],gamma_pp[BSL4_L+1];
+	double sigma[BSL4_L+1];
+	int i,j;
+
+	switch (ph) {
+		case PHASE_VARS:
+			base=EnsureCPUL4Workspace(9,"BiCGStab(4) L=4 workspace");
+			r[0]=rvec; u[0]=pvec; rtilda=base;
+			for (i=1;i<=BSL4_L;i++) r[i]=base+(size_t)i*local_nRows;
+			for (i=1;i<=BSL4_L;i++) u[i]=base+(size_t)(BSL4_L+i)*local_nRows;
+			for (i=0;i<9;i++) { vectors[i].ptr=base+(size_t)i*local_nRows; vectors[i].size=sizeof(doublecomplex); }
+			scalars[0].ptr=&rho; scalars[1].ptr=&alpha; scalars[2].ptr=&omega;
+			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(double complex);
+			return;
+
+		case PHASE_INIT:
+			if (!load_chpoint) {
+				double nrm;
+				IT_COPY(rtilda,rvec);
+				nrm=sqrt(MAX(0.0,creal(GPDot(rtilda,rtilda,&Timing_InitIterComm))));
+				if (nrm<BSL4_EPS) LogError(ONE_POS,"BiCGStab(4) cannot start from a zero residual");
+				IT_MULT_SELF(rtilda,1.0/nrm);
+				IT_MULT_CMPLX(u[0],rvec,0);
+				rho=1; alpha=0; omega=1;
+			}
+			return;
+
+		case PHASE_ITER:
+			rho=-omega*rho;
+			for (j=0;j<BSL4_L;j++) {
+				if (cabs(rho)<BSL4_EPS) LogError(ONE_POS,"BiCGStab(4) breakdown: rho is zero");
+				rho1=GPDot(rtilda,r[j],&Timing_OneIterComm);
+				beta=alpha*rho1/rho;
+				rho=rho1;
+				temp=-beta;
+				for (i=0;i<=j;i++) IT_INCREM10_CMPLX(u[i],r[i],temp,NULL,NULL); /* u_i=r_i-beta*u_i */
+#ifdef ADDA_CUDA
+				/* Save one full CUDA vector: do not register Avecbuffer for this solver. */
+				IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#else
+				if (niter==1 && j==0 && matvec_ready) IT_COPY(u[1],Avecbuffer);
+				else IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#endif
+				den=GPDot(rtilda,u[j+1],&Timing_OneIterComm);
+				if (cabs(den)<BSL4_EPS) LogError(ONE_POS,"BiCGStab(4) breakdown: <r~,u_%d> is zero",j+1);
+				alpha=rho/den;
+				temp=-alpha;
+				for (i=0;i<=j;i++) IT_INCREM01_CMPLX(r[i],u[i+1],temp,NULL,NULL);
+				IT_MATVEC(r[j],r[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+				IT_INCREM01_CMPLX(xvec,u[0],alpha,NULL,NULL);
+			}
+
+			memset(tau,0,sizeof(tau));
+			memset(gamma_p,0,sizeof(gamma_p));
+			memset(gamma,0,sizeof(gamma));
+			memset(gamma_pp,0,sizeof(gamma_pp));
+			for (j=1;j<=BSL4_L;j++) {
+				for (i=1;i<j;i++) {
+					tau[j-1][i-1]=GPDot(r[i],r[j],&Timing_OneIterComm)/sigma[i];
+					temp=-tau[j-1][i-1];
+					IT_INCREM01_CMPLX(r[j],r[i],temp,NULL,NULL);
+				}
+				sigma[j]=creal(GPDot(r[j],r[j],&Timing_OneIterComm));
+				if (!(sigma[j]>BSL4_EPS)) LogError(ONE_POS,"BiCGStab(4) breakdown in MR polynomial at r_%d",j);
+				gamma_p[j]=GPDot(r[j],r[0],&Timing_OneIterComm)/sigma[j];
+			}
+			omega=gamma[BSL4_L]=gamma_p[BSL4_L];
+			for (j=BSL4_L-1;j>=1;j--) {
+				gamma[j]=gamma_p[j];
+				for (i=j+1;i<=BSL4_L;i++) gamma[j]-=tau[i-1][j-1]*gamma[i];
+			}
+			for (j=1;j<BSL4_L;j++) {
+				gamma_pp[j]=gamma[j+1];
+				for (i=j+1;i<BSL4_L;i++) gamma_pp[j]+=tau[i-1][j-1]*gamma[i+1];
+			}
+			IT_INCREM01_CMPLX(xvec,r[0],gamma[1],NULL,NULL);
+			temp=-gamma_p[BSL4_L]; IT_INCREM01_CMPLX(r[0],r[BSL4_L],temp,NULL,NULL);
+			temp=-gamma[BSL4_L]; IT_INCREM01_CMPLX(u[0],u[BSL4_L],temp,NULL,NULL);
+			for (j=1;j<BSL4_L;j++) {
+				IT_INCREM01_CMPLX(xvec,r[j],gamma_pp[j],NULL,NULL);
+				temp=-gamma_p[j]; IT_INCREM01_CMPLX(r[0],r[j],temp,NULL,NULL);
+				temp=-gamma[j]; IT_INCREM01_CMPLX(u[0],u[j],temp,NULL,NULL);
+			}
+			inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+			return;
+	}
+	LogError(ONE_POS,"Unknown phase (%d) of BiCGStab(4)",(int)ph);
+#undef BSL4_L
+#undef BSL4_EPS
+}
+
+//======================================================================================================================
+
+ITER_FUNC(GPBiCGStab2)
+/* GPBiCGStab(2), specialized to L=2 and adapted from the IFDDA
+ * GPBICGSTABL recurrence.  This implementation deliberately avoids the raw
+ * 4*L+8 workspace layout.  Eleven resident vectors are sufficient by reusing
+ * the old q/s history after each BiCG substep.  MatVec remains unchanged.
+ *
+ * Fixed persistent state between outer iterations:
+ *   rvec=r0, pvec=p0, vec1=r~0, vec2=z, vec3=y, vec4=u,
+ *   vec5=s0(previous r1), vec6=q0(previous p1), vec7=q1(previous p2).
+ * Avecbuffer is the only free work vector at the outer-iteration boundary.
+ */
+{
+#define GP_EPS 1E-30
+	static doublecomplex * restrict rtilda,* restrict z,* restrict y,* restrict u;
+	static doublecomplex * restrict hs,* restrict hq0,* restrict hq1,* restrict work;
+	static double complex rho,sigma,alpha,beta,zeta1,zeta2,eta;
+	static double complex mat[3][3],rhs[3];
+	static double complex temp;
+	static bool fresh_start;
+
+	switch (ph) {
+		case PHASE_VARS:
+			rtilda=vec1; z=vec2; y=vec3; u=vec4;
+			hs=vec5; hq0=vec6; hq1=vec7; work=Avecbuffer;
+			scalars[0].ptr=&fresh_start;
+			scalars[0].size=sizeof(bool);
+			/* The seven semantic state vectors have fixed physical identities at
+			 * every iteration boundary, so checkpoints need no permutation metadata. */
+			vectors[0].ptr=vec1; vectors[1].ptr=vec2; vectors[2].ptr=vec3; vectors[3].ptr=vec4;
+			vectors[4].ptr=vec5; vectors[5].ptr=vec6; vectors[6].ptr=vec7;
+			vectors[0].size=vectors[1].size=vectors[2].size=vectors[3].size=
+				vectors[4].size=vectors[5].size=vectors[6].size=sizeof(doublecomplex);
+			return;
+
+		case PHASE_INIT:
+			if (!load_chpoint || gp2_restart_request) {
+				IT_COPY(rtilda,rvec); /* r~0 = r0 */
+				IT_COPY(pvec,rvec);   /* p0  = r0 */
+				IT_MULT_CMPLX(z,rvec,0); /* z=0 */
+				fresh_start=true;
+			}
+			return;
+
+		case PHASE_ITER:
+			if (fresh_start) {
+				/* -------- Initial BiCG polynomial, j=1 -------- */
+				rho=GPDot(rtilda,rvec,&Timing_OneIterComm);
+				if (niter==1 && matvec_ready) { /* work=Avecbuffer already equals A*r0=A*p0 */ }
+				else IT_MATVEC(pvec,work,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* p1 */
+				sigma=GPDot(rtilda,work,&Timing_OneIterComm);
+				if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma1 is zero");
+				alpha=rho/sigma;
+				IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+				temp=-alpha; IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+				IT_MATVEC(rvec,hs,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* r1 */
+				rho=GPDot(rtilda,hs,&Timing_OneIterComm);
+				beta=rho/sigma;
+				temp=-beta; IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); /* p0=r0-beta*p0 */
+				IT_INCREM10_CMPLX(work,hs,temp,NULL,NULL);             /* p1=r1-beta*p1 */
+
+				/* -------- Initial BiCG polynomial, j=2 -------- */
+				IT_MATVEC(work,hq1,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* p2 */
+				sigma=GPDot(rtilda,hq1,&Timing_OneIterComm);
+				if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma2 is zero");
+				alpha=rho/sigma;
+				IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+				temp=-alpha;
+				IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+				IT_INCREM01_CMPLX(hs,hq1,temp,NULL,NULL); /* r1 -= alpha*p2 */
+				IT_MATVEC(hs,hq0,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* r2 */
+				rho=GPDot(rtilda,hq0,&Timing_OneIterComm);
+				beta=rho/sigma;
+				temp=-beta;
+				IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL);
+				IT_INCREM10_CMPLX(work,hs,temp,NULL,NULL);
+				IT_INCREM10_CMPLX(hq1,hq0,temp,NULL,NULL); /* p2=r2-beta*p2 */
+
+				/* L=2 residual minimization: M=[r1,r2]. */
+				mat[0][0]=GPDot(hs,hs,&Timing_OneIterComm);
+				mat[0][1]=GPDot(hs,hq0,&Timing_OneIterComm);
+				mat[1][0]=conj(mat[0][1]);
+				mat[1][1]=GPDot(hq0,hq0,&Timing_OneIterComm);
+				rhs[0]=GPDot(hs,rvec,&Timing_OneIterComm);
+				rhs[1]=GPDot(hq0,rvec,&Timing_OneIterComm);
+				if (!GPSolveSmallN(&mat[0][0],rhs,2,3)) LogError(ONE_POS,"GPBiCGStab(2) breakdown in initial 2x2 minimization");
+				zeta1=rhs[0]; zeta2=rhs[1];
+
+				/* z=zeta1*r0+zeta2*r1; x+=z.  Carry y/u directly as the
+				 * correction removed from r0/p0, eliminating r' and p' vectors. */
+				IT_LINCOMB_CMPLX(z,rvec,hs,zeta1,zeta2,NULL,NULL);
+				IT_INCREM(xvec,z,NULL,NULL);
+				IT_LINCOMB_CMPLX(y,hs,hq0,zeta1,zeta2,NULL,NULL);
+				IT_LINCOMB_CMPLX(u,work,hq1,zeta1,zeta2,NULL,NULL);
+				IT_INCREM01_CMPLX(rvec,y,-1,NULL,NULL);
+				IT_INCREM01_CMPLX(pvec,u,-1,NULL,NULL);
+				/* Preserve histories for the first full GP cycle: hs=r1, q0=p1, q1=p2.
+				 * hq0 currently holds dead r2; work holds p1. */
+				IT_COPY(hq0,work);
+				inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm);
+				fresh_start=false;
+				return;
+			}
+
+			/* ================= Full GPBiCGStab(2) cycle ================= */
+			rho=GPDot(rtilda,rvec,&Timing_OneIterComm);
+
+			/* j=1: p1=A*p0. */
+			IT_MATVEC(pvec,work,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+			sigma=GPDot(rtilda,work,&Timing_OneIterComm);
+			if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma1 is zero");
+			alpha=rho/sigma;
+			IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+			temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); /* z-=alpha*u */
+			IT_INCREM011_CMPLX(y,hq0,work,-alpha,alpha);       /* y-=alpha*(q0-p1) */
+			IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+			/* s0 <- s0-alpha*q1; q1 is then free and becomes r1. */
+			IT_INCREM01_CMPLX(hs,hq1,temp,NULL,NULL);
+			IT_MATVEC(rvec,hq1,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* r1 */
+			rho=GPDot(rtilda,hq1,&Timing_OneIterComm);
+			beta=rho/sigma;
+			temp=-beta;
+			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); /* p0 */
+			IT_INCREM10_CMPLX(work,hq1,temp,NULL,NULL); /* p1 */
+			IT_INCREM10_CMPLX(hq0,hs,temp,NULL,NULL);   /* q0=s0-beta*q0; hs now free */
+			IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);       /* u=y-beta*u */
+
+			/* j=2: hs is free and becomes p2. */
+			IT_MATVEC(work,hs,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+			sigma=GPDot(rtilda,hs,&Timing_OneIterComm);
+			if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma2 is zero");
+			alpha=rho/sigma;
+			IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+			temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL);
+			IT_INCREM011_CMPLX(y,hq0,work,-alpha,alpha); /* y-=alpha*(q0-p1) */
+			/* q0 history is dead after the previous line and can become r2. */
+			IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+			IT_INCREM01_CMPLX(hq1,hs,temp,NULL,NULL); /* r1 -= alpha*p2 */
+			IT_MATVEC(hq1,hq0,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* r2 */
+			rho=GPDot(rtilda,hq0,&Timing_OneIterComm);
+			beta=rho/sigma;
+			temp=-beta;
+			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL);
+			IT_INCREM10_CMPLX(work,hq1,temp,NULL,NULL); /* p1 */
+			IT_INCREM10_CMPLX(hs,hq0,temp,NULL,NULL);   /* p2 */
+			IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);       /* u=y-beta*u */
+
+			/* 3x3 local minimization with basis [r1,r2,y]. */
+			mat[0][0]=GPDot(hq1,hq1,&Timing_OneIterComm);
+			mat[0][1]=GPDot(hq1,hq0,&Timing_OneIterComm);
+			mat[0][2]=GPDot(hq1,y,&Timing_OneIterComm);
+			mat[1][0]=conj(mat[0][1]);
+			mat[1][1]=GPDot(hq0,hq0,&Timing_OneIterComm);
+			mat[1][2]=GPDot(hq0,y,&Timing_OneIterComm);
+			mat[2][0]=conj(mat[0][2]);
+			mat[2][1]=conj(mat[1][2]);
+			mat[2][2]=GPDot(y,y,&Timing_OneIterComm);
+			rhs[0]=GPDot(hq1,rvec,&Timing_OneIterComm);
+			rhs[1]=GPDot(hq0,rvec,&Timing_OneIterComm);
+			rhs[2]=GPDot(y,rvec,&Timing_OneIterComm);
+			if (!GPSolveSmallN(&mat[0][0],rhs,3,3)) LogError(ONE_POS,"GPBiCGStab(2) breakdown in 3x3 minimization");
+			zeta1=rhs[0]; zeta2=rhs[1]; eta=rhs[2];
+
+			/* z=eta*z+zeta1*r0+zeta2*r1; x+=z. */
+			IT_INCREM111_CMPLX(z,rvec,hq1,eta,zeta1,zeta2);
+			IT_INCREM(xvec,z,NULL,NULL);
+			/* Carry the exact correction vectors into the next outer cycle:
+			 * y_next=eta*y+zeta1*r1+zeta2*r2,
+			 * u_next=eta*u+zeta1*p1+zeta2*p2. */
+			IT_INCREM111_CMPLX(y,hq1,hq0,eta,zeta1,zeta2);
+			IT_INCREM111_CMPLX(u,work,hs,eta,zeta1,zeta2);
+			IT_INCREM01_CMPLX(rvec,y,-1,NULL,NULL);
+			IT_INCREM01_CMPLX(pvec,u,-1,NULL,NULL);
+
+			/* Restore fixed history identities with D2D copies.  r2 is dead, so
+			 * hq0 is a temporary: hq0<-p2; hs<-r1; hq1<-p2; hq0<-p1. */
+			IT_COPY(hq0,hs);
+			IT_COPY(hs,hq1);
+			IT_COPY(hq1,hq0);
+			IT_COPY(hq0,work);
+
+			inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm);
+			return;
+	}
+	LogError(ONE_POS,"Unknown phase (%d) of GPBiCGStab(2)",(int)ph);
+#undef GP_EPS
+}
+
+//======================================================================================================================
+
+ITER_FUNC(GPBiCGStab4)
+/* GPBiCGStab(4), memory-reduced L=4 specialization.
+ *
+ * Algebraically follows the IFDDA GPBiCGStab(L) recurrence for L=4, but folds
+ * large-vector lifetimes exactly as in the existing GPBiCGStab(2) CUDA port.
+ * Persistent boundary state: r0,p0,r~0,z,y,u,s0..s2,q0..q3 plus one transient
+ * work vector.  This needs 15 CUDA-resident vectors including x/r/p/work,
+ * instead of the raw IFDDA 25-vector layout. MatVec stays in native precision;
+ * GPDot() preserves the chunked FP64 reductions in CUDA single precision.
+ */
+{
+#define GP4_L 4
+#define GP4_EPS 1E-30
+	static doublecomplex *rtilda,*z,*y,*u,*hs[GP4_L-1],*hq[GP4_L],*work;
+	static double complex rho,sigma_c,alpha,beta,temp,zeta[GP4_L],eta;
+	doublecomplex *base;
+	doublecomplex *rr[GP4_L+1],*pp[GP4_L+1];
+	double complex mat[GP4_L+1][GP4_L+1],rhs[GP4_L+1];
+	int i,j;
+
+#define GP4_BIND_POLY() do { \
+	rr[0]=rvec; rr[1]=hq[3]; rr[2]=hq[2]; rr[3]=hq[1]; rr[4]=hq[0]; \
+	pp[0]=pvec; pp[1]=work; pp[2]=hs[2]; pp[3]=hs[1]; pp[4]=hs[0]; \
+} while(0)
+#define GP4_RESTORE_HISTORY() do { \
+	IT_COPY(hq[0],hs[0]); IT_COPY(hs[0],hq[3]); IT_COPY(hq[3],hq[0]); \
+	IT_COPY(hq[0],hs[1]); IT_COPY(hs[1],hq[2]); IT_COPY(hq[2],hq[0]); \
+	IT_COPY(hq[0],hs[2]); IT_COPY(hs[2],hq[1]); IT_COPY(hq[1],hq[0]); \
+	IT_COPY(hq[0],work); \
+} while(0)
+
+	switch (ph) {
+		case PHASE_VARS:
+			base=EnsureCPUL4Workspace(11,"GPBiCGStab(4) L=4 workspace");
+			rtilda=base; z=base+local_nRows; y=base+2*local_nRows; u=base+3*local_nRows;
+			for (i=0;i<GP4_L-1;i++) hs[i]=base+(size_t)(4+i)*local_nRows;
+			for (i=0;i<GP4_L;i++) hq[i]=base+(size_t)(7+i)*local_nRows;
+			work=Avecbuffer;
+			for (i=0;i<11;i++) { vectors[i].ptr=base+(size_t)i*local_nRows; vectors[i].size=sizeof(doublecomplex); }
+			return;
+		case PHASE_INIT:
+			if (!load_chpoint) { IT_COPY(rtilda,rvec); IT_COPY(pvec,rvec); IT_MULT_CMPLX(z,rvec,0); }
+			return;
+		case PHASE_ITER:
+			GP4_BIND_POLY();
+			if (niter==1) {
+				rho=GPDot(rtilda,rr[0],&Timing_OneIterComm);
+				for (j=1;j<=GP4_L;j++) {
+					if (j==1 && matvec_ready) { /* work==Avecbuffer is already ready */ }
+					else IT_MATVEC(pp[j-1],pp[j],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+					sigma_c=GPDot(rtilda,pp[j],&Timing_OneIterComm);
+					if (cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: initial sigma%d is zero",j);
+					alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pp[0],alpha,NULL,NULL); temp=-alpha;
+					for (i=0;i<j;i++) IT_INCREM01_CMPLX(rr[i],pp[i+1],temp,NULL,NULL);
+					IT_MATVEC(rr[j-1],rr[j],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+					rho=GPDot(rtilda,rr[j],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
+					for (i=0;i<=j;i++) IT_INCREM10_CMPLX(pp[i],rr[i],temp,NULL,NULL);
+				}
+				memset(mat,0,sizeof(mat)); memset(rhs,0,sizeof(rhs));
+				for (i=0;i<GP4_L;i++) { for (j=0;j<GP4_L;j++) mat[i][j]=GPDot(rr[i+1],rr[j+1],&Timing_OneIterComm); rhs[i]=GPDot(rr[i+1],rr[0],&Timing_OneIterComm); }
+				if (!GPSolveSmallN(&mat[0][0],rhs,GP4_L,GP4_L+1)) LogError(ONE_POS,"GPBiCGStab(4) breakdown in initial 4x4 minimization");
+				for (i=0;i<GP4_L;i++) zeta[i]=rhs[i];
+				IT_MULT_CMPLX(z,rr[0],zeta[0]); for (i=1;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_INCREM(xvec,z,NULL,NULL);
+				IT_MULT_CMPLX(y,rr[1],zeta[0]); IT_MULT_CMPLX(u,pp[1],zeta[0]);
+				for (i=1;i<GP4_L;i++) { IT_INCREM01_CMPLX(y,rr[i+1],zeta[i],NULL,NULL); IT_INCREM01_CMPLX(u,pp[i+1],zeta[i],NULL,NULL); }
+				IT_INCREM01_CMPLX(rr[0],y,-1,NULL,NULL); IT_INCREM01_CMPLX(pp[0],u,-1,NULL,NULL);
+				GP4_RESTORE_HISTORY(); inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm); return;
+			}
+
+			rho=GPDot(rtilda,rvec,&Timing_OneIterComm);
+			/* j=1 */
+			IT_MATVEC(pvec,work,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,work,&Timing_OneIterComm);
+			if (cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma1 is zero");
+			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+			for (i=0;i<3;i++) IT_INCREM01_CMPLX(hs[i],hq[i+1],temp,NULL,NULL);
+			IT_MATVEC(rvec,hq[3],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[3],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
+			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); for(i=0;i<3;i++) IT_INCREM10_CMPLX(hq[i],hs[i],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
+			/* j=2 */
+			IT_MATVEC(work,hs[2],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[2],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma2 is zero");
+			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL);
+			for (i=0;i<2;i++) IT_INCREM01_CMPLX(hs[i],hq[i+1],temp,NULL,NULL);
+			IT_MATVEC(hq[3],hq[2],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+			rho=GPDot(rtilda,hq[2],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
+			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); for(i=0;i<2;i++) IT_INCREM10_CMPLX(hq[i],hs[i],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
+			/* j=3 */
+			IT_MATVEC(hs[2],hs[1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[1],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma3 is zero");
+			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hs[0],hq[1],temp,NULL,NULL);
+			IT_MATVEC(hq[2],hq[1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[1],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta; IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[1],hq[1],temp,NULL,NULL); IT_INCREM10_CMPLX(hq[0],hs[0],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
+			/* j=4 */
+			IT_MATVEC(hs[1],hs[0],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[0],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma4 is zero");
+			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[1],hs[0],temp,NULL,NULL);
+			IT_MATVEC(hq[1],hq[0],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[0],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta; IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[1],hq[1],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[0],hq[0],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
+
+			GP4_BIND_POLY(); memset(mat,0,sizeof(mat)); memset(rhs,0,sizeof(rhs));
+			for(i=0;i<GP4_L;i++){ for(j=0;j<GP4_L;j++) mat[i][j]=GPDot(rr[i+1],rr[j+1],&Timing_OneIterComm); mat[i][GP4_L]=GPDot(rr[i+1],y,&Timing_OneIterComm); mat[GP4_L][i]=conj(mat[i][GP4_L]); rhs[i]=GPDot(rr[i+1],rr[0],&Timing_OneIterComm); }
+			mat[GP4_L][GP4_L]=GPDot(y,y,&Timing_OneIterComm); rhs[GP4_L]=GPDot(y,rr[0],&Timing_OneIterComm);
+			if (!GPSolveSmallN(&mat[0][0],rhs,GP4_L+1,GP4_L+1))
+				LogError(ONE_POS,"GPBiCGStab(4) breakdown in 5x5 minimization");
+			for (i=0;i<GP4_L;i++) zeta[i]=rhs[i];
+			eta=rhs[GP4_L];
+			IT_MULT_SELF_CMPLX(z,eta); for(i=0;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_INCREM(xvec,z,NULL,NULL);
+			IT_MULT_SELF_CMPLX(y,eta); IT_MULT_SELF_CMPLX(u,eta); for(i=0;i<GP4_L;i++){ IT_INCREM01_CMPLX(y,rr[i+1],zeta[i],NULL,NULL); IT_INCREM01_CMPLX(u,pp[i+1],zeta[i],NULL,NULL); }
+			IT_INCREM01_CMPLX(rr[0],y,-1,NULL,NULL); IT_INCREM01_CMPLX(pp[0],u,-1,NULL,NULL); GP4_RESTORE_HISTORY(); inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm); return;
+	}
+	LogError(ONE_POS,"Unknown phase (%d) of GPBiCGStab(4)",(int)ph);
+#undef GP4_RESTORE_HISTORY
+#undef GP4_BIND_POLY
+#undef GP4_L
+#undef GP4_EPS
+}
 
 //======================================================================================================================
 
@@ -1663,6 +2297,13 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 		if (ind_m>=LENGTH(params))
 			LogError(ONE_POS,"Parameters for the given iterative solver are not found in list 'params'");
 	}
+#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+	if (reliable_resid && method_in!=IT_GPBICGSTAB2 && method_in!=IT_BCGS2)
+		LogWarning(EC_WARN,ONE_POS,"-reliable_resid currently applies only to CUDA float32 BiCGStab(2)/BCGS2 and GPBiCGStab(2); option ignored");
+#else
+	if (reliable_resid)
+		LogWarning(EC_WARN,ONE_POS,"-reliable_resid currently applies only to CUDA float32 BiCGStab(2)/BCGS2 and GPBiCGStab(2); option ignored");
+#endif
 	// initialize data required for checkpoints and specific variables
 	chp_exit=false;
 	complete=true;
@@ -1678,13 +2319,29 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 #ifdef ADDA_CUDA
 	/* Initial-field/checkpoint construction above is still host-side. Upload the
 	 * complete iterative-solver state once, immediately before the solver starts using GPU vectors. */
-	CudaIterInit((int)method_in);
+	if (method_in==IT_BICGSTAB4 || method_in==IT_GPBICGSTAB4) {
+		const size_t extra=(size_t)params[ind_m].vec_N;
+		const size_t work_extra=(method_in==IT_GPBICGSTAB4 ? 1u : 0u);
+		const size_t count=3u+extra+work_extra;
+		const void *ids[15];
+		size_t ci=0,k;
+		ids[ci++]=xvec; ids[ci++]=rvec; ids[ci++]=pvec;
+		for (k=0;k<extra;k++) ids[ci++]=vectors[k].ptr;
+		if (work_extra) ids[ci++]=Avecbuffer;
+		CudaIterInitList(ids,count,method_in==IT_BICGSTAB4 ? "BiCGStab(4)" : "GPBiCGStab(4)");
+	}
+	else CudaIterInit((int)method_in);
 #endif
 	(*params[ind_m].func)(PHASE_INIT);
 	// Initialization time includes generating the incident beam
 	Timing_InitIter = GET_TIME() - tstart;
 	Timing_InitIterComm += Timing_MVPComm; // Timing_MVPComm should (by here) include only iteration initialization
 	Timing_IntFieldOneComm=Timing_InitIterComm;
+#ifdef ADDA_CUDA
+	/* Snapshot the actual GPU footprint after solver PHASE_INIT and immediately
+	 * before entering the iterative loop. */
+	CudaIterPrintMemoryBeforeLoop();
+#endif
 	// main iteration cycle
 	while (inprodR>epsB && niter<=maxiter && counter<=params[ind_m].mc && !chp_exit) {
 		// initialize time
@@ -1692,6 +2349,48 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 		tstart=GET_TIME();
 		// main execution
 		(*params[ind_m].func)(PHASE_ITER);
+#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+		if (reliable_resid && (method_in==IT_GPBICGSTAB2 || method_in==IT_BCGS2) && complete &&
+			((niter%20)==0 || inprodRp1<=epsB)) {
+			const double recursive_norm2=inprodRp1;
+			const reliable_residual_result rr=ReliableResidualCheck(method_in,recursive_norm2);
+			if (IFROOT) {
+				const char *method_name=(method_in==IT_GPBICGSTAB2 ? "GPBiCGStab(2)" : "BiCGStab(2)/BCGS2");
+				const double recursive_err=sqrt(MAX(0.0,resid_scale*recursive_norm2));
+				const double true_err=sqrt(MAX(0.0,resid_scale*rr.true_norm2));
+				const double ratio=(recursive_err>0 ? true_err/recursive_err : 0);
+				if (rr.restart) {
+					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
+						", true="EFORM", true/recursive="GFORM", gap="GFORM
+						"; Krylov recurrence restarted%s%s\n",method_name,niter,recursive_err,true_err,ratio,rr.gap,
+						rr.forced_restart ? " (forced validation restart)" : "",
+						rr.false_convergence ? " (false recursive convergence)" : "");
+				}
+				else if (rr.true_converged) {
+					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
+						", true="EFORM", true/recursive="GFORM", gap="GFORM
+						"; true residual confirms convergence\n",method_name,niter,recursive_err,true_err,ratio,rr.gap);
+				}
+				else {
+					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
+						", true="EFORM", true/recursive="GFORM", gap="GFORM
+						"; below restart threshold "GFORM", continuing without restart\n",
+						method_name,niter,recursive_err,true_err,ratio,rr.gap,(double)RELIABLE_GAP_TOL);
+				}
+			}
+			if (rr.restart) {
+				inprodRp1=rr.true_norm2;
+				inprodR=rr.true_norm2;
+				counter=0;
+			}
+			else if (rr.true_converged) {
+				/* An independently recomputed residual satisfies the stopping
+				 * criterion. Accept it even if the recursive norm is slightly larger. */
+				inprodRp1=rr.true_norm2;
+				inprodR=rr.true_norm2;
+			}
+		}
+#endif
 		// finalize time; time for incomplete iteration may be inadequate
 		Timing_OneIterComm+=Timing_OneIterMVPComm;
 		Timing_IntFieldOneComm+=Timing_OneIterComm;
@@ -1722,6 +2421,10 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	 * post-processing) consumes host arrays. One final D2H synchronization is
 	 * therefore required when an iterative solver is CUDA-resident. */
 	CudaIterSyncToHost();
+	/* Solver-only vectors are no longer needed after the final D2H sync. Free
+	 * them now; d_arg/d_result remain available for CPU-facing MatVec(), e.g.
+	 * the optional residual recalculation below. */
+	CudaIterRelease();
 #endif
 	/* process incomplete convergence
 	 * Since maxiter can be used in several reasonable ways, e.g. to control execution time, we allow calculation of
@@ -1746,6 +2449,7 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 			PRINTFB("%s",tmp_str);
 		}
 	}
+	if (method_in==IT_BICGSTAB4 || method_in==IT_GPBICGSTAB4) FreeCPUL4Workspace();
 	// post-processing
 	if (params[ind_m].sc_N>0) Free_general(scalars);
 	if (params[ind_m].vec_N>0) Free_general(vectors);

@@ -26,11 +26,13 @@ if ($HostCompiler) {
     $ccbin = $HostCompiler
 } else {
     $cl = Get-Command "cl.exe" -ErrorAction SilentlyContinue
-    if (-not $cl) {
-        throw @"
+if (-not $cl) {
+    throw @"
 cl.exe est introuvable.
-Sous Windows, nvcc doit utiliser un compilateur hote CUDA supporte (MSVC).
-Ouvrez 'x64 Native Tools Command Prompt for Visual Studio', puis relancez PowerShell,
+CUDA peut etre installe sans Visual Studio, mais la compilation d'une DLL CUDA
+avec nvcc sous Windows necessite un compilateur hote compatible.
+Installez Visual Studio Build Tools avec la charge « Desktop development with C++ »,
+puis ouvrez « x64 Native Tools Command Prompt for VS » avant de relancer ce script.
 ou passez -HostCompiler avec le chemin du repertoire contenant cl.exe.
 ADDA lui-meme n'est PAS compile avec MSVC : seul le fichier .cu passe par nvcc.
 "@
@@ -40,10 +42,14 @@ ADDA lui-meme n'est PAS compile avec MSVC : seul le fichier .cu passe par nvcc.
 
 $CuFile = Join-Path $Root "src\cudamatvec_backend.cu"
 $DefFile = Join-Path $Root "src\cudamatvec_backend.def"
+$DefFileSingle = Join-Path $Root "src\cudamatvec_backend_single.def"
 $IncludeDir = Join-Path $Root "src"
 $BackendDll = Join-Path $Out "adda_cuda_backend.dll"
 $BackendMsvcLib = Join-Path $Out "adda_cuda_backend.lib"
 $BackendGnuLib = Join-Path $Out "libadda_cuda_backend.a"
+$BackendDllSingle = Join-Path $Out "adda_cuda_backend_single.dll"
+$BackendMsvcLibSingle = Join-Path $Out "adda_cuda_backend_single.lib"
+$BackendGnuLibSingle = Join-Path $Out "libadda_cuda_backend_single.a"
 
 $nvccArgs = @(
     "-std=c++14",
@@ -72,15 +78,39 @@ if ($CudaArch) {
     }
 }
 
-Write-Host "[CUDA 1/2] Compilation du backend avec nvcc uniquement"
+Write-Host "[CUDA 1/4] Compilation du backend double avec nvcc uniquement"
 & $nvcc @nvccArgs
 if ($LASTEXITCODE -ne 0) { throw "nvcc a echoue ($LASTEXITCODE)" }
 if (-not (Test-Path $BackendDll)) { throw "DLL CUDA non produite: $BackendDll" }
 
-Write-Host "[CUDA 2/2] Creation de l'import library GNU pour MinGW"
+Write-Host "[CUDA 2/4] Creation de l'import library GNU double pour MinGW"
 & $dlltool --def $DefFile --dllname "adda_cuda_backend.dll" --output-lib $BackendGnuLib
 if ($LASTEXITCODE -ne 0) { throw "dlltool a echoue ($LASTEXITCODE)" }
 if (-not (Test-Path $BackendGnuLib)) { throw "Import library MinGW non produite: $BackendGnuLib" }
+
+Write-Host "[CUDA 3/4] Compilation du backend float32 avec nvcc"
+$singleArgs = $nvccArgs.Clone()
+# Rebuild arguments explicitly to avoid accidentally keeping double output/DEF paths.
+$singleArgs = @(
+    "-std=c++14", "--shared", "-ccbin", $ccbin, "-DADDA_CUDA_SINGLE_BACKEND",
+    "-I$IncludeDir", $CuFile, "-lcufft", "-lcublas",
+    "-Xlinker", "/DEF:$DefFileSingle", "-Xlinker", "/IMPLIB:$BackendMsvcLibSingle",
+    "-o", $BackendDllSingle
+)
+if ($Configuration -eq "Debug") { $singleArgs = @("-G", "-O0", "-Xcompiler", "/MDd,/Od") + $singleArgs }
+else { $singleArgs = @("-O3", "-Xcompiler", "/MD,/O2") + $singleArgs }
+if ($CudaArch) {
+    if ($CudaArch -ieq "native") { $singleArgs = @("-arch=native") + $singleArgs }
+    else { $arch = $CudaArch -replace '^sm_', ''; $singleArgs = @("-arch=sm_$arch") + $singleArgs }
+}
+& $nvcc @singleArgs
+if ($LASTEXITCODE -ne 0) { throw "nvcc float32 a echoue ($LASTEXITCODE)" }
+if (-not (Test-Path $BackendDllSingle)) { throw "DLL CUDA float32 non produite: $BackendDllSingle" }
+
+Write-Host "[CUDA 4/4] Creation de l'import library GNU float32"
+& $dlltool --def $DefFileSingle --dllname "adda_cuda_backend_single.dll" --output-lib $BackendGnuLibSingle
+if ($LASTEXITCODE -ne 0) { throw "dlltool float32 a echoue ($LASTEXITCODE)" }
+if (-not (Test-Path $BackendGnuLibSingle)) { throw "Import library MinGW float32 non produite: $BackendGnuLibSingle" }
 
 if (-not $SkipTest) {
     $TestCu = Join-Path $Root "tests\cuda_matvec_test.cu"
@@ -111,7 +141,9 @@ if (-not $SkipTest) {
 }
 
 Write-Host ""
-Write-Host "Backend CUDA pret pour MinGW :"
-Write-Host "  DLL       : $BackendDll"
-Write-Host "  import lib: $BackendGnuLib"
+Write-Host "Backends CUDA prets pour MinGW :"
+Write-Host "  double DLL       : $BackendDll"
+Write-Host "  double import lib: $BackendGnuLib"
+Write-Host "  float32 DLL      : $BackendDllSingle"
+Write-Host "  float32 import lib: $BackendGnuLibSingle"
 Write-Host "CMake/CLion ne doit jamais compiler cudamatvec_backend.cu."

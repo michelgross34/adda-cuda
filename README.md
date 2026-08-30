@@ -40,6 +40,77 @@ The CUDA backend DLLs are:
 | `adda_cuda_backend.dll` | double / `float64` | CUDA backend for double-precision CUDA executables |
 | `adda_cuda_backend_single.dll` | single / `float32` | CUDA backend for single-precision CUDA executables |
 
+## CMake entry points
+
+The root `CMakeLists.txt` contains the shared source lists and build rules. The
+platform-specific files only select the appropriate options and call the root
+configuration, so the source list is not duplicated:
+
+```text
+CMakeLists.txt        Shared CMake configuration
+windows/CMakeLists.txt Windows / MinGW / CUDA entry point
+linux/CMakeLists.txt   Linux / CPU entry point
+```
+
+Use the platform-specific entry point when configuring from a clean checkout.
+Do not configure the Windows build from `linux/`, or the Linux build from
+`windows/`.
+
+Windows with MinGW (after generating the CUDA backends):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_cuda_backend.ps1 -CudaArch native
+cmake -S windows -B build-windows -G Ninja
+cmake --build build-windows --target adda_cuda_single -j 14
+```
+
+Linux uses the CPU targets and does not try to link the Windows CUDA DLL/import
+libraries. FFTW libraries must be installed on the Linux system or supplied
+through `FFTW3_ROOT`, `FFTW3_LIBRARY`, and `FFTW3F_LIBRARY`:
+
+```bash
+cmake -S linux -B build-linux -G Ninja
+cmake --build build-linux -j
+```
+
+The root `CMakeLists.txt` remains the shared implementation used by both entry points.
+
+## The `fftw/` directory
+
+The repository root contains a Windows FFTW3 distribution in `fftw/`. CMake
+detects this directory automatically when `fftw/fftw3.h` is present, so no
+separate FFTW installation is needed for the standard Windows configuration.
+
+The files most useful for building ADDA on Windows are:
+
+| File | Purpose |
+|---|---|
+| `fftw3.h` | FFTW3 C header included by ADDA |
+| `libfftw3.dll.a` | MinGW import library for double precision |
+| `libfftw3-3.dll` | Runtime DLL for double-precision CPU/CUDA executables |
+| `libfftw3f.dll.a` | MinGW import library for single precision |
+| `libfftw3f-3.dll` | Runtime DLL for single-precision executables |
+| `libfftw3.a`, `libfftw3f.a` | Static libraries, available for alternative link configurations |
+
+The directory also contains FFTW Fortran interfaces, long-double/quadruple
+precision variants, threaded/ OpenMP variants, and FFTW wisdom utilities. They
+are not required by the default ADDA CMake targets. The CMake build copies the
+appropriate `libfftw3-3.dll` or `libfftw3f-3.dll` next to each executable.
+
+For a different FFTW installation, override the automatic detection, for
+example:
+
+```powershell
+cmake -S windows -B build-windows -G Ninja `
+  -DFFTW3_ROOT="C:/path/to/fftw" `
+  -DFFTW3_LIBRARY="C:/path/to/fftw/libfftw3.dll.a" `
+  -DFFTW3F_LIBRARY="C:/path/to/fftw/libfftw3f.dll.a"
+```
+
+On Linux, the files in this Windows-oriented `fftw/` directory should not be
+used as native libraries. Install FFTW for Linux or provide Linux-compatible
+paths through `FFTW3_ROOT`, `FFTW3_LIBRARY`, and `FFTW3F_LIBRARY`.
+
 The names above describe the builds tested on Windows on 28 August 2026. The repository contains source code and build scripts; compiled binaries are not required to be committed to Git.
 
 ## Precision and convergence
@@ -115,6 +186,56 @@ scripts\\build_cuda_backend.bat 86 "F:\\mingw64_11.2\\bin"
 ```
 
 The Makefile is the authoritative Windows build entry point for the ADDA sources. CMake/CLion may be used to organize the project, but `nvcc` remains a separate build step.
+
+## Precompiled Windows binaries
+
+This repository includes a Windows Debug build in:
+
+```text
+windows/cmake-build-debug/bin/
+```
+
+The directory contains the ADDA executables, the FFTW runtime DLLs, and the
+CUDA backend DLLs. This build was compiled with the CUDA 11.8 Toolkit and the
+CUDA code was generated for compute capability 7.0 (`sm_70`), matching an
+NVIDIA Titan V. It is therefore a ready-to-run reference build for that CUDA
+environment and GPU generation, subject to a compatible NVIDIA driver.
+
+The CUDA DLLs required by the executables are:
+
+```text
+cuda-backend/adda_cuda_backend.dll
+cuda-backend/adda_cuda_backend_single.dll
+```
+
+At runtime, the appropriate CUDA DLL must be next to the executable in the
+same directory. The Windows CMake post-build step copies these files to
+`windows/cmake-build-debug/bin/`. If an executable is moved elsewhere, copy
+the matching CUDA DLL from `cuda-backend/` beside it. The FFTW DLLs must also
+remain beside the executable.
+
+If the user has another CUDA Toolkit version or another GPU architecture, the
+CUDA backend must be rebuilt locally. From the repository root, open an
+environment where `nvcc.exe`, a supported MSVC host compiler (`cl.exe`), and
+MinGW `dlltool.exe` are available, then run:
+
+```bat
+scripts\build_cuda_backend.bat 70 "F:\mingw64_11.2\bin"
+```
+
+Replace `70` with the target GPU compute capability, or omit the architecture
+argument to use `-arch=native` when supported by the installed CUDA Toolkit.
+The script builds both double-precision and float32 backends and writes the
+new DLLs and GNU import libraries into `cuda-backend/`. Rebuild the ADDA
+executables with the Windows CMake entry point afterwards:
+
+```powershell
+cmake -S windows -B build-windows -G Ninja
+cmake --build build-windows -j 14
+```
+
+The generated `.a` import libraries are used for linking with MinGW; the DLLs
+are needed at runtime and must be located beside the corresponding executable.
 
 ## Running ADDA
 

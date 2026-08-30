@@ -146,6 +146,8 @@ enum init_field InitField; // how to calculate initial field for the iterative s
 const char *infi_fnameY;   // names of files, defining the initial field (for two polarizations)
 const char *infi_fnameX;
 bool recalc_resid;         // whether to recalculate residual at the end of iterative solver
+bool reliable_resid;       // reliable true-residual/restart updates for CUDA float32 BiCGStab(2)/GPBiCGStab(2)
+bool reliable_resid_force_restart; // force a restart at each reliable-residual control (validation option)
 enum chpoint chp_type;     // type of checkpoint (to save)
 time_t chp_time;           // time of checkpoint (in sec)
 char const *chp_dir;       // directory name to save/load checkpoint
@@ -418,6 +420,8 @@ PARSE_FUNC(pol);
 PARSE_FUNC(prognosis);
 PARSE_FUNC(prop);
 PARSE_FUNC(recalc_resid);
+PARSE_FUNC(reliable_resid);
+PARSE_FUNC(reliable_resid_force_restart);
 PARSE_FUNC(rect_dip);
 #ifndef SPARSE
 PARSE_FUNC(save_geom);
@@ -567,7 +571,9 @@ static struct opt_struct options[]={
 		 * !!! If subarguments are added, second-to-last argument should be changed from 1 to UNDEF, and consistency
 		 * test for number of arguments should be implemented in PARSE_FUNC(int_surf) below.
 		 */
-	{PAR(iter),"{bcgs2|bicg|bicgstab|cgnr|csym|qmr|qmr2}","Sets the iterative solver.\n"
+	{PAR(iter),"{bcgs2|bicg|bicgstab|bicgstab2|bicgstab4|cgnr|csym|gpbicgstab2|gpbicgstab4|qmr|qmr2}","Sets the iterative solver.\n"
+		"'bicgstab2' is an alias for ADDA's enhanced BCGS2 implementation (BiCGStab(l) with l=2).\n"
+		"'bicgstab4' and 'gpbicgstab4' are available in CPU and CUDA builds; CUDA keeps all large L=4 vectors GPU-resident.\n"
 		"Default: qmr",1,NULL},
 		/* TO ADD NEW ITERATIVE SOLVER
 		 * add the short name, used to define the new iterative solver in the command line, to the list "{...}" in the
@@ -639,6 +645,15 @@ static struct opt_struct options[]={
 		"vector) is performed automatically. For point-dipole incident beam this determines its direction.\n"
 		"Default: 0 0 1",3,NULL},
 	{PAR(recalc_resid),"","Recalculate residual at the end of iterative solver.",0,NULL},
+	{PAR(reliable_resid),"","For CUDA float32 BiCGStab(2)/BCGS2 and GPBiCGStab(2), periodically compute the true "
+		"residual r=b-Ax and the vector residual gap. A control is performed every 20 outer iterations and before "
+		"accepting convergence. The Krylov recurrence is restarted only when the relative vector gap is at least "
+		"1e-3, or when recursive convergence is not confirmed by the true residual. Each control adds one MatVec "
+		"and two targeted downloads, but no additional resident GPU vector.",0,NULL},
+	{PAR(reliable_resid_force_restart),"","Validation option for CUDA float32 BiCGStab(2)/BCGS2 and GPBiCGStab(2). "
+		"Implies -reliable_resid and forces a Krylov restart after every periodic reliable-residual control, even when "
+		"the vector gap is below 1e-3. A true residual that already satisfies the stopping criterion is accepted without "
+		"an unnecessary restart.",0,NULL},
 	{PAR(rect_dip),"<x> <y> <z>","Use rectangular-cuboid dipoles. Three arguments are the relative voxel sizes along "
 		"the corresponding axes. Absolute scale is irrelevant, i.e. '1 2 2' is equivalent to '0.5 1 1'. Cannot be used "
 		"with '-anisotr' and '-granul'. The compatible polarizability and interaction-term formulations are also "
@@ -1331,8 +1346,12 @@ PARSE_FUNC(iter)
 	if (strcmp(argv[1],"bcgs2")==0) IterMethod=IT_BCGS2;
 	else if (strcmp(argv[1],"bicg")==0) IterMethod=IT_BICG_CS;
 	else if (strcmp(argv[1],"bicgstab")==0) IterMethod=IT_BICGSTAB;
+	else if (strcmp(argv[1],"bicgstab2")==0) IterMethod=IT_BCGS2;
+	else if (strcmp(argv[1],"bicgstab4")==0 || strcmp(argv[1],"bicgstabl4")==0) IterMethod=IT_BICGSTAB4;
 	else if (strcmp(argv[1],"cgnr")==0) IterMethod=IT_CGNR;
 	else if (strcmp(argv[1],"csym")==0) IterMethod=IT_CSYM;
+	else if (strcmp(argv[1],"gpbicgstab2")==0 || strcmp(argv[1],"gpbicgstabl2")==0) IterMethod=IT_GPBICGSTAB2;
+	else if (strcmp(argv[1],"gpbicgstab4")==0 || strcmp(argv[1],"gpbicgstabl4")==0) IterMethod=IT_GPBICGSTAB4;
 	else if (strcmp(argv[1],"qmr")==0) IterMethod=IT_QMR_CS;
 	else if (strcmp(argv[1],"qmr2")==0) IterMethod=IT_QMR_CS_2;
 	/* TO ADD NEW ITERATIVE SOLVER
@@ -1480,6 +1499,15 @@ PARSE_FUNC(prop)
 PARSE_FUNC(recalc_resid)
 {
 	recalc_resid=true;
+}
+PARSE_FUNC(reliable_resid)
+{
+	reliable_resid=true;
+}
+PARSE_FUNC(reliable_resid_force_restart)
+{
+	reliable_resid=true;
+	reliable_resid_force_restart=true;
 }
 PARSE_FUNC(rect_dip)
 {
@@ -2056,6 +2084,8 @@ void InitVariables(void)
 	igt_eps=UNDEF;
 	InitField=IF_AUTO;
 	recalc_resid=false;
+	reliable_resid=false;
+	reliable_resid_force_restart=false;
 	surface=false;
 	msubInf=false;
 	ReflRelation=(enum refl)UNDEF;
@@ -2655,8 +2685,11 @@ void PrintInfo(void)
 			case IT_BCGS2: fprintf(logfile,"Enhanced Bi-CG Stabilized(2)\n"); break;
 			case IT_BICG_CS: fprintf(logfile,"Bi-CG (complex symmetric)\n"); break;
 			case IT_BICGSTAB: fprintf(logfile,"Bi-CG Stabilized\n"); break;
+			case IT_BICGSTAB4: fprintf(logfile,"BiCGStab(4)\n"); break;
 			case IT_CGNR: fprintf(logfile,"CGNR\n"); break;
 			case IT_CSYM: fprintf(logfile,"CSYM\n"); break;
+			case IT_GPBICGSTAB2: fprintf(logfile,"GPBiCGStab(2)\n"); break;
+			case IT_GPBICGSTAB4: fprintf(logfile,"GPBiCGStab(4)\n"); break;
 			case IT_QMR_CS: fprintf(logfile,"QMR (complex symmetric)\n"); break;
 			case IT_QMR_CS_2: fprintf(logfile,"2-term QMR (complex symmetric)\n"); break;
 		}

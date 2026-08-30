@@ -1,4 +1,4 @@
-LIBRARY adda_cuda_backend
+LIBRARY adda_cuda_backend_single
 EXPORTS
     adda_cuda_matvec_init
     adda_cuda_matvec_init_slice
