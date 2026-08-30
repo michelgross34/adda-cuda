@@ -1,0 +1,1139 @@
+--- /mnt/data/iterative.c	2026-08-26 19:01:30.375782299 +0000
++++ src/iterative.c	2026-08-26 19:19:18.989691704 +0000
+@@ -22,6 +22,9 @@
+ // project headers
+ #include "cmplx.h"
+ #include "comm.h"
++#ifdef ADDA_CUDA
++#	include "cudamatvec.h"
++#endif
+ #include "debug.h"
+ #include "io.h"
+ #include "linalg.h"
+@@ -248,6 +251,11 @@
+ 	TIME_TYPE tstart;
+ 
+ 	tstart=GET_TIME();
++#ifdef ADDA_CUDA
++	/* During CUDA QMR the device copy is authoritative.  Checkpoints are host
++	 * file I/O, therefore synchronize the seven QMR vectors only here. */
++	if (params[ind_m].meth==IT_QMR_CS) CudaQMRSyncToHost();
++#endif
+ 	if (IFROOT) {
+ 		// create directory "chp_dir" if needed and open info file
+ 		SnprintfErr(ONE_POS,fname,MAX_FNAME,"%s/"F_CHP_LOG,chp_dir);
+@@ -1005,6 +1013,37 @@
+ 
+ //======================================================================================================================
+ 
++/* Keep one QMR_CS algorithm in C.  Only the large-vector primitives are
++ * selected here: CPU linalg/MatVec for the normal build, CUDA-resident
++ * wrappers for ADDA_CUDA. */
++#ifdef ADDA_CUDA
++#	define QMR_MATVEC                 MatVec_GPU
++#	define QMR_DOT_SELF               CudaQMRDotProdSelf_conj
++#	define QMR_DOT                    CudaQMRDotProd_conj
++#	define QMR_DOT_SELF_NORM2         CudaQMRDotProdSelf_conj_Norm2
++#	define QMR_MULT                    CudaQMRMult_cmplx
++#	define QMR_MULT_SELF               CudaQMRMultSelf_cmplx
++#	define QMR_LINCOMB1                CudaQMRLinComb1_cmplx
++#	define QMR_LINCOMB                 CudaQMRLinComb_cmplx
++#	define QMR_INCREM110               CudaQMRIncrem110_cmplx
++#	define QMR_INCREM111               CudaQMRIncrem111_cmplx
++#	define QMR_INCREM01                CudaQMRIncrem01_cmplx
++#	define QMR_INCREM11_D_C            CudaQMRIncrem11_d_c
++#else
++#	define QMR_MATVEC                 MatVec
++#	define QMR_DOT_SELF               nDotProdSelf_conj
++#	define QMR_DOT                    nDotProd_conj
++#	define QMR_DOT_SELF_NORM2         nDotProdSelf_conj_Norm2
++#	define QMR_MULT                    nMult_cmplx
++#	define QMR_MULT_SELF               nMultSelf_cmplx
++#	define QMR_LINCOMB1                nLinComb1_cmplx
++#	define QMR_LINCOMB                 nLinComb_cmplx
++#	define QMR_INCREM110               nIncrem110_cmplx
++#	define QMR_INCREM111               nIncrem111_cmplx
++#	define QMR_INCREM01                nIncrem01_cmplx
++#	define QMR_INCREM11_D_C            nIncrem11_d_c
++#endif
++
+ ITER_FUNC(QMR_CS)
+ /* Quasi Minimum Residual for Complex Symmetric systems, based on:
+  * Freund R.W. "Conjugate gradient-type methods for linear systems with complex symmetric coefficient matrices",
+@@ -1053,11 +1092,11 @@
+ 				// omega_0=||v_0||=0
+ 				omega_old=0.0;
+ 				// beta_1=sqrt(v~_1(*).v~_1); omega_1=||v~_1||/|beta_1|; (v~_1=r_0)
+-				beta=csqrt(nDotProdSelf_conj(rvec,&Timing_InitIterComm));
++				beta=csqrt(QMR_DOT_SELF(rvec,&Timing_InitIterComm));
+ 				omega_new=sqrt(inprodR)/cabs(beta); // inprodR=nNorm2(r_0)
+ 				// v_1=v~_1/beta_1
+ 				temp1=1/beta;
+-				nMult_cmplx(v,rvec,temp1);
++				QMR_MULT(v,rvec,temp1);
+ 				// tau~_1=omega_1*beta_1
+ 				tautilda=omega_new*beta;
+ 				// c_0=c_-1=1; s_0=s_-1=0
+@@ -1076,16 +1115,16 @@
+ 			// A.v_k; alpha_k=v_k(*).(A.v_k)
+ 			if (niter==1 && matvec_ready) { // uses that v_1=r_0/beta
+ 				temp1=1/beta;
+-				nMultSelf_cmplx(Avecbuffer,temp1);
++				QMR_MULT_SELF(Avecbuffer,temp1);
+ 			}
+-			else MatVec(v,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+-			alpha=nDotProd_conj(v,Avecbuffer,&Timing_OneIterComm);
++			else QMR_MATVEC(v,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
++			alpha=QMR_DOT(v,Avecbuffer,&Timing_OneIterComm);
+ 			// v~_k+1=-beta_k*v_k-1-alpha_k*v_k+A.v_k
+ 			temp2=-alpha;
+-			if (niter==1) nLinComb1_cmplx(vtilda,v,Avecbuffer,temp2,NULL,NULL); // use explicitly that v_0=0
++			if (niter==1) QMR_LINCOMB1(vtilda,v,Avecbuffer,temp2,NULL,NULL); // use explicitly that v_0=0
+ 			else {
+ 				temp1=-beta;
+-				nIncrem110_cmplx(vtilda,v,Avecbuffer,temp1,temp2);
++				QMR_INCREM110(vtilda,v,Avecbuffer,temp1,temp2);
+ 			}
+ 			// theta_k=s_k-2(*)*omega_k-1*beta_k
+ 			theta=conj(s_old)*omega_old*beta;
+@@ -1096,7 +1135,7 @@
+ 			zetatilda = c_new*omega_new*alpha - s_new*c_old*omega_old*beta;
+ 			// beta_k+1=sqrt(v~_k+1(*).v~_k+1); omega_k+1=||v~_k+1||/|beta_k+1|
+ 			omega_old=omega_new;
+-			temp1=nDotProdSelf_conj_Norm2(vtilda,&dtmp1,&Timing_OneIterComm); // dtmp1=||v~||^2
++			temp1=QMR_DOT_SELF_NORM2(vtilda,&dtmp1,&Timing_OneIterComm); // dtmp1=||v~||^2
+ 			beta=csqrt(temp1);
+ 			/* Here we do not check for zero beta, since exact zero is very improbable and the following code (until the
+ 			 * end of iteration) employs only the product omega_k+1*beta_k+1. So the (almost) breakdown is instead
+@@ -1118,13 +1157,13 @@
+ 			s_new=omega_new*beta/zeta;
+ 			// p_k=(-theta_k*p_k-2-eta_k*p_k-1+v_k)/zeta_k
+ 			temp4=1/zeta; // temp4=1/zeta_k;
+-			if (niter==1) nMult_cmplx(p_new,v,temp4); // use implicitly that p_0=p_-1=0
++			if (niter==1) QMR_MULT(p_new,v,temp4); // use implicitly that p_0=p_-1=0
+ 			else {
+ 				temp2=-eta*temp4; // temp2=-eta_k/zeta_k
+-				if (niter==2) nLinComb_cmplx(p_old,p_new,v,temp2,temp4,NULL,NULL);
++				if (niter==2) QMR_LINCOMB(p_old,p_new,v,temp2,temp4,NULL,NULL);
+ 				else {
+ 					temp1=-theta*temp4; // temp1=-theta_k/zeta_k
+-					nIncrem111_cmplx(p_old,p_new,v,temp1,temp2,temp4);
++					QMR_INCREM111(p_old,p_new,v,temp1,temp2,temp4);
+ 				}
+ 				SwapPointers(&p_old,&p_new);
+ 			}
+@@ -1133,21 +1172,32 @@
+ 			// tau~_k+1=-s_k*tau~_k
+ 			tautilda=-s_new*tautilda;
+ 			// x_k=x_k-1+tau_k*p_k
+-			nIncrem01_cmplx(xvec,p_new,tau,NULL,NULL);
++			QMR_INCREM01(xvec,p_new,tau,NULL,NULL);
+ 			// v_k+1=v~_k+1/beta_k+1
+ 			temp1=1/beta;
+-			nMultSelf_cmplx(vtilda,temp1);
++			QMR_MULT_SELF(vtilda,temp1);
+ 			SwapPointers(&v,&vtilda); // v~ is as v_k-1 at next iteration
+ 			// r_k = |s_k|^2*r_k-1 + (c_k*tau~_k+1/omega_k+1)*v_k+1
+ 			temp1=(c_new/omega_new)*tautilda;
+-			nIncrem11_d_c(rvec,v,cAbs2(s_new),temp1,&inprodRp1,&Timing_OneIterComm);
++			QMR_INCREM11_D_C(rvec,v,cAbs2(s_new),temp1,&inprodRp1,&Timing_OneIterComm);
+ 			return; // end of PHASE_ITER
+ 	}
+ 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
+ }
+-#undef EPS1L
+-#undef EPS1H
++#undef EPS1
+ #undef EPS2
++#undef QMR_MATVEC
++#undef QMR_DOT_SELF
++#undef QMR_DOT
++#undef QMR_DOT_SELF_NORM2
++#undef QMR_MULT
++#undef QMR_MULT_SELF
++#undef QMR_LINCOMB1
++#undef QMR_LINCOMB
++#undef QMR_INCREM110
++#undef QMR_INCREM111
++#undef QMR_INCREM01
++#undef QMR_INCREM11_D_C
+ 
+ //======================================================================================================================
+ 
+@@ -1581,6 +1631,11 @@
+ 	(*params[ind_m].func)(PHASE_VARS);
+ 	// load checkpoint, if needed, and finish initialization of the iterative solver
+ 	if (load_chpoint) LoadIterChpoint();
++#ifdef ADDA_CUDA
++	/* Initial-field/checkpoint construction above is still host-side. Upload the
++	 * complete QMR state once, immediately before QMR starts using GPU vectors. */
++	if (method_in==IT_QMR_CS) CudaQMRInit();
++#endif
+ 	(*params[ind_m].func)(PHASE_INIT);
+ 	// Initialization time includes generating the incident beam
+ 	Timing_InitIter = GET_TIME() - tstart;
+@@ -1618,6 +1673,12 @@
+ 	}
+ 	// Save checkpoint of type always
+ 	if (chp_type==CHP_ALWAYS && !chp_exit) SaveIterChpoint();
++#ifdef ADDA_CUDA
++	/* The rest of IterativeSolver (optional residual recalculation and field
++	 * post-processing) consumes host arrays. One final D2H synchronization is
++	 * therefore required when QMR_CS was CUDA-resident. */
++	if (method_in==IT_QMR_CS) CudaQMRSyncToHost();
++#endif
+ 	/* process incomplete convergence
+ 	 * Since maxiter can be used in several reasonable ways, e.g. to control execution time, we allow calculation of
+ 	 * (potentially inaccurate) scattering quantities, when it is reached. We leave the warning although it may be
+--- /mnt/data/cudamatvec.c	2026-08-26 19:01:29.499786832 +0000
++++ src/cudamatvec.c	2026-08-26 19:17:50.370584048 +0000
+@@ -1,10 +1,9 @@
+-/* ADDA integration wrapper for the CUDA MatVec backend.
++/* ADDA integration wrapper for the CUDA MatVec/QMR backend.
+  *
+- * The CUDA implementation is intentionally sequential-only.  The existing CPU
+- * and MPI/OpenCL sources are left untouched and remain available in their own
+- * build configurations.  Static FFT Green tensors and geometry are uploaded by
+- * CudaMatVecInit(); cc_sqrt is refreshed by InitCC(); only Krylov vectors are
+- * transferred for each MatVec call.
++ * The CUDA implementation is intentionally sequential-only.  CPU/MPI/OpenCL
++ * configurations are untouched.  The traditional MatVec() uploads/downloads
++ * its Krylov vectors, whereas MatVec_GPU() addresses CUDA-resident QMR vectors
++ * and performs no vector transfer across PCIe.
+  */
+ #include "const.h" /* keep this first */
+ #include "cudamatvec.h"
+@@ -17,6 +16,7 @@
+ #include "prec_time.h"
+ #include "vars.h"
+ 
++#include <complex.h>
+ #include <stdlib.h>
+ 
+ #ifdef PARALLEL
+@@ -33,13 +33,22 @@
+ extern const size_t DsizeY,DsizeZ,RsizeY;
+ extern size_t TotalMatVec;
+ 
++/* QMR vectors are defined in calculator.c. */
++extern doublecomplex *rvec;
++extern doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict Avecbuffer;
++
+ #ifdef PRECISE_TIMING
+ void FreeEverything(void);
+ #endif
+ 
+ static void CudaCheck(const int status,const char *where)
+ {
+-    if (status != 0) LogError(ONE_POS,"CUDA MatVec error in %s: %s",where,adda_cuda_matvec_last_error());
++    if (status != 0) LogError(ONE_POS,"CUDA error in %s: %s",where,adda_cuda_matvec_last_error());
++}
++
++static doublecomplex MakeComplex(const double re,const double im)
++{
++    return re + I*im;
+ }
+ 
+ void CudaMatVecInit(void)
+@@ -57,7 +66,7 @@
+     cfg.surface=surface ? 1 : 0;
+     cfg.reduced_fft=reduced_FFT ? 1 : 0;
+     cfg.device=-1;
+-    CudaCheck(adda_cuda_matvec_init(&cfg,Dmatrix,surface ? Rmatrix : NULL,material,position),"initialization");
++    CudaCheck(adda_cuda_matvec_init(&cfg,Dmatrix,surface ? Rmatrix : NULL,material,position),"CUDA backend initialization");
+ }
+ 
+ void CudaMatVecUpdateCC(void)
+@@ -71,12 +80,13 @@
+     if (!prognosis) adda_cuda_matvec_free();
+ }
+ 
+-void MatVec(doublecomplex * restrict argvec,
+-            doublecomplex * restrict resultvec,
+-            double *inprod,
+-            const bool her,
+-            TIME_TYPE *timing,
+-            TIME_TYPE *comm_timing)
++static void MatVecCommon(doublecomplex * restrict argvec,
++                         doublecomplex * restrict resultvec,
++                         double *inprod,
++                         const bool her,
++                         TIME_TYPE *timing,
++                         TIME_TYPE *comm_timing,
++                         const bool resident)
+ {
+     const bool ipr=(inprod!=NULL);
+     TIME_TYPE tstart=GET_TIME();
+@@ -88,8 +98,12 @@
+ #endif
+ 
+     double cuda_time_ms=0.0;
+-    CudaCheck(adda_cuda_matvec_execute(argvec,resultvec,her ? 1 : 0,inprod,&cuda_time_ms),"execution");
+-    PrintBoth(logfile,"CUDA MatVec GPU time (without CPU-GPU copies): %.6f ms\n",cuda_time_ms);
++    if (resident)
++        CudaCheck(adda_cuda_matvec_execute_gpu(argvec,resultvec,her ? 1 : 0,inprod,&cuda_time_ms),"MatVec_GPU execution");
++    else
++        CudaCheck(adda_cuda_matvec_execute(argvec,resultvec,her ? 1 : 0,inprod,&cuda_time_ms),"MatVec execution");
++
++    PrintBoth(logfile,"CUDA MatVec GPU time%s: %.6f ms\n",resident ? " (resident vectors)" : " (without CPU-GPU copies)",cuda_time_ms);
+     if (ipr) MyInnerProduct(inprod,double_type,1,comm_timing);
+ 
+ #ifdef PRECISE_TIMING
+@@ -100,8 +114,10 @@
+             "             CUDA MatVec timing           \n"
+             "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n"
+             "Total = "FFORMPT"\n\n"
+-            "CUDA MatVec precise phase timing is not enabled; the total includes H2D/D2H vector transfers, kernels and cuFFT.\n",
+-            DiffSystemTime(tvp,tvp+1));
++            "%s\n",
++            DiffSystemTime(tvp,tvp+1),
++            resident ? "MatVec_GPU uses resident CUDA vectors (no H2D/D2H vector copies)."
++                     : "MatVec includes H2D/D2H vector transfers; reported GPU time excludes those copies.");
+         PRINTFB("\nPrecise timing is complete. Finishing execution.\n");
+     }
+     FreeEverything();
+@@ -112,4 +128,117 @@
+     TotalMatVec++;
+ }
+ 
++void MatVec(doublecomplex * restrict argvec,
++            doublecomplex * restrict resultvec,
++            double *inprod,
++            const bool her,
++            TIME_TYPE *timing,
++            TIME_TYPE *comm_timing)
++{
++    MatVecCommon(argvec,resultvec,inprod,her,timing,comm_timing,false);
++}
++
++void MatVec_GPU(doublecomplex * restrict argvec,
++                doublecomplex * restrict resultvec,
++                double *inprod,
++                const bool her,
++                TIME_TYPE *timing,
++                TIME_TYPE *comm_timing)
++{
++    MatVecCommon(argvec,resultvec,inprod,her,timing,comm_timing,true);
++}
++
++void CudaQMRInit(void)
++{
++    CudaCheck(adda_cuda_qmr_init(xvec,rvec,pvec,vec1,vec2,vec3,Avecbuffer),"QMR resident-vector initialization");
++}
++
++void CudaQMRSyncToHost(void)
++{
++    CudaCheck(adda_cuda_qmr_download_all(),"QMR device-to-host synchronization");
++}
++
++doublecomplex CudaQMRDotProd_conj(const doublecomplex * restrict a,
++                                  const doublecomplex * restrict b,
++                                  TIME_TYPE *comm_timing)
++{
++    double re=0.0,im=0.0;
++    (void)comm_timing; /* ADDA_CUDA is sequential; no MPI reduction is needed. */
++    CudaCheck(adda_cuda_qmr_dotu(a,b,&re,&im),"QMR cublasZdotu");
++    return MakeComplex(re,im);
++}
++
++doublecomplex CudaQMRDotProdSelf_conj(const doublecomplex * restrict a,TIME_TYPE *comm_timing)
++{
++    return CudaQMRDotProd_conj(a,a,comm_timing);
++}
++
++doublecomplex CudaQMRDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
++                                            double * restrict norm,
++                                            TIME_TYPE *comm_timing)
++{
++    double re=0.0,im=0.0;
++    (void)comm_timing;
++    CudaCheck(adda_cuda_qmr_dotu_self_norm2(a,&re,&im,norm),
++              "QMR cublasZdotu+cublasDznrm2");
++    return MakeComplex(re,im);
++}
++
++void CudaQMRMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const doublecomplex c)
++{
++    CudaCheck(adda_cuda_qmr_mult(a,b,creal(c),cimag(c)),"QMR multiply kernel");
++}
++
++void CudaQMRMultSelf_cmplx(doublecomplex * restrict a,const doublecomplex c)
++{
++    CudaCheck(adda_cuda_qmr_mult_self(a,creal(c),cimag(c)),"QMR self-multiply kernel");
++}
++
++void CudaQMRLinComb1_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                           const doublecomplex * restrict c,const doublecomplex c1,
++                           double * restrict inprod,TIME_TYPE *comm_timing)
++{
++    if (inprod!=NULL) LogError(ONE_POS,"CUDA QMR LinComb1 does not support an in-line norm in QMR_CS");
++    (void)comm_timing;
++    CudaCheck(adda_cuda_qmr_lincomb1(a,b,c,creal(c1),cimag(c1)),"QMR LinComb1 kernel");
++}
++
++void CudaQMRLinComb_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                          const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2,
++                          double * restrict inprod,TIME_TYPE *comm_timing)
++{
++    if (inprod!=NULL) LogError(ONE_POS,"CUDA QMR LinComb does not support an in-line norm in QMR_CS");
++    (void)comm_timing;
++    CudaCheck(adda_cuda_qmr_lincomb(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2)),"QMR LinComb kernel");
++}
++
++void CudaQMRIncrem110_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                            const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2)
++{
++    CudaCheck(adda_cuda_qmr_increm110(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2)),"QMR Increm110 kernel");
++}
++
++void CudaQMRIncrem111_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                            const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2,
++                            const doublecomplex c3)
++{
++    CudaCheck(adda_cuda_qmr_increm111(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2),creal(c3),cimag(c3)),
++              "QMR Increm111 kernel");
++}
++
++void CudaQMRIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const doublecomplex c,
++                           double * restrict inprod,TIME_TYPE *comm_timing)
++{
++    if (inprod!=NULL) LogError(ONE_POS,"CUDA QMR Increm01 does not support an in-line norm in QMR_CS");
++    (void)comm_timing;
++    CudaCheck(adda_cuda_qmr_increm01(a,b,creal(c),cimag(c)),"QMR Increm01 kernel");
++}
++
++void CudaQMRIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restrict b,const double c1,
++                         const doublecomplex c2,double * restrict inprod,TIME_TYPE *comm_timing)
++{
++    (void)comm_timing;
++    CudaCheck(adda_cuda_qmr_increm11_d_c(a,b,c1,creal(c2),cimag(c2),inprod),"QMR Increm11+norm kernel");
++}
++
+ #endif /* ADDA_CUDA */
+--- /mnt/data/cudamatvec.h	2026-08-26 19:01:31.423776874 +0000
++++ src/cudamatvec.h	2026-08-26 19:17:50.369289527 +0000
+@@ -1,11 +1,58 @@
+-/* C-facing integration of the CUDA MatVec backend with ADDA globals. */
++/* C-facing integration of the CUDA MatVec/QMR backend with ADDA globals. */
+ #ifndef ADDA_CUDAMATVEC_H
+ #define ADDA_CUDAMATVEC_H
+ 
+ #ifdef ADDA_CUDA
++
++#include "timing.h"
++#include "types.h"
++#include <stdbool.h>
++
+ void CudaMatVecInit(void);
+ void CudaMatVecUpdateCC(void);
+ void CudaMatVecFree(void);
+-#endif
++
++/* MatVec on CUDA-resident QMR vectors. The pointer values identify registered
++ * ADDA host vectors; this routine performs no H2D/D2H vector copies. */
++void MatVec_GPU(doublecomplex * restrict argvec,
++                doublecomplex * restrict resultvec,
++                double *inprod,
++                bool her,
++                TIME_TYPE *timing,
++                TIME_TYPE *comm_timing);
++
++/* QMR_CS resident-vector lifecycle. */
++void CudaQMRInit(void);
++void CudaQMRSyncToHost(void);
++
++/* cuBLAS reductions. Names mirror the CPU linalg functions used by QMR_CS. */
++doublecomplex CudaQMRDotProd_conj(const doublecomplex * restrict a,
++                                  const doublecomplex * restrict b,
++                                  TIME_TYPE *comm_timing);
++doublecomplex CudaQMRDotProdSelf_conj(const doublecomplex * restrict a,
++                                      TIME_TYPE *comm_timing);
++doublecomplex CudaQMRDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
++                                            double * restrict norm,
++                                            TIME_TYPE *comm_timing);
++
++/* CUDA kernels used by QMR_CS. */
++void CudaQMRMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,doublecomplex c);
++void CudaQMRMultSelf_cmplx(doublecomplex * restrict a,doublecomplex c);
++void CudaQMRLinComb1_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                           const doublecomplex * restrict c,doublecomplex c1,
++                           double * restrict inprod,TIME_TYPE *comm_timing);
++void CudaQMRLinComb_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                          const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2,
++                          double * restrict inprod,TIME_TYPE *comm_timing);
++void CudaQMRIncrem110_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                            const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2);
++void CudaQMRIncrem111_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
++                            const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2,doublecomplex c3);
++void CudaQMRIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,doublecomplex c,
++                           double * restrict inprod,TIME_TYPE *comm_timing);
++void CudaQMRIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restrict b,double c1,doublecomplex c2,
++                         double * restrict inprod,TIME_TYPE *comm_timing);
++
++#endif /* ADDA_CUDA */
+ 
+ #endif /* ADDA_CUDAMATVEC_H */
+--- /mnt/data/cudamatvec_backend.cu	2026-08-26 19:01:31.167778200 +0000
++++ src/cudamatvec_backend.cu	2026-08-26 19:19:18.989465430 +0000
+@@ -22,6 +22,7 @@
+ 
+ #include <cuda_runtime.h>
+ #include <cufft.h>
++#include <cublas_v2.h>
+ #include <cuComplex.h>
+ 
+ #include <cerrno>
+@@ -61,6 +62,17 @@
+     cufftHandle planZ = 0;  /* surface: Z transform, executed once per component */
+     cudaEvent_t matvec_start = nullptr;
+     cudaEvent_t matvec_stop = nullptr;
++    cublasHandle_t cublas = nullptr;
++
++    /* CUDA-resident QMR_CS vectors. Host addresses are stable identities.
++     * d_arg and d_result are reused for two QMR vectors, so QMR needs only
++     * five extra vector allocations instead of seven. */
++    static const int QMR_VECTOR_COUNT = 7;
++    static const int QMR_EXTRA_VECTOR_COUNT = 5;
++    const void *qmr_host[QMR_VECTOR_COUNT] = {};
++    cuDoubleComplex *qmr_device[QMR_VECTOR_COUNT] = {};
++    cuDoubleComplex *d_qmr_extra = nullptr;
++    bool qmr_initialized = false;
+ };
+ 
+ Context g;
+@@ -148,6 +160,34 @@
+     return -1;
+ }
+ 
++const char *cublasErrorString(cublasStatus_t err)
++{
++    switch (err) {
++        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
++        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
++        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
++        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
++        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
++        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
++        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
++        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
++#if defined(CUBLAS_STATUS_NOT_SUPPORTED)
++        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
++#endif
++#if defined(CUBLAS_STATUS_LICENSE_ERROR)
++        case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
++#endif
++        default: return "unknown cuBLAS error";
++    }
++}
++
++int failCublas(cublasStatus_t err, const char *what)
++{
++    if (err == CUBLAS_STATUS_SUCCESS) return 0;
++    setDetailedError(what,cublasErrorString(err));
++    return -1;
++}
++
+ bool checkedMul(size_t a, size_t b, size_t &out)
+ {
+     if (a != 0 && b > SIZE_MAX / a) return false;
+@@ -181,12 +221,14 @@
+ 
+ void freeContext()
+ {
++    if (g.cublas) { cublasDestroy(g.cublas); g.cublas = nullptr; }
+     if (g.matvec_stop) { cudaEventDestroy(g.matvec_stop); g.matvec_stop = nullptr; }
+     if (g.matvec_start) { cudaEventDestroy(g.matvec_start); g.matvec_start = nullptr; }
+     if (g.planZ) { cufftDestroy(g.planZ); g.planZ = 0; }
+     if (g.planXY) { cufftDestroy(g.planXY); g.planXY = 0; }
+     if (g.plan3d) { cufftDestroy(g.plan3d); g.plan3d = 0; }
+ 
++    cudaFree(g.d_qmr_extra); g.d_qmr_extra = nullptr;
+     cudaFree(g.d_gridR); g.d_gridR = nullptr;
+     cudaFree(g.d_grid); g.d_grid = nullptr;
+     cudaFree(g.d_result); g.d_result = nullptr;
+@@ -200,6 +242,19 @@
+     g = Context{};
+ }
+ 
++cuDoubleComplex *qmrDeviceVector(const void *host_id)
++{
++    if (!g.qmr_initialized || host_id == nullptr) {
++        setError("QMR CUDA vectors are not initialized");
++        return nullptr;
++    }
++    for (int i=0; i<Context::QMR_VECTOR_COUNT; ++i) {
++        if (g.qmr_host[i] == host_id) return g.qmr_device[i];
++    }
++    setError("unknown host vector passed to CUDA QMR backend");
++    return nullptr;
++}
++
+ __global__ void scatterKernel(const cuDoubleComplex *arg,
+                               cuDoubleComplex *grid,
+                               const unsigned char *material,
+@@ -368,6 +423,74 @@
+     }
+ }
+ 
++
++__global__ void qmrMultKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                              cuDoubleComplex c, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cmul(c,b[i]);
++}
++
++__global__ void qmrMultSelfKernel(cuDoubleComplex *a, cuDoubleComplex c, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cmul(c,a[i]);
++}
++
++__global__ void qmrLinComb1Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                  const cuDoubleComplex *c, cuDoubleComplex c1, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cadd_hd(cmul(c1,b[i]),c[i]);
++}
++
++__global__ void qmrLinCombKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                 const cuDoubleComplex *c, cuDoubleComplex c1,
++                                 cuDoubleComplex c2, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cadd_hd(cmul(c1,b[i]),cmul(c2,c[i]));
++}
++
++__global__ void qmrIncrem110Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                   const cuDoubleComplex *c, cuDoubleComplex c1,
++                                   cuDoubleComplex c2, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cadd_hd(cadd_hd(cmul(c1,a[i]),cmul(c2,b[i])),c[i]);
++}
++
++__global__ void qmrIncrem111Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                   const cuDoubleComplex *c, cuDoubleComplex c1,
++                                   cuDoubleComplex c2, cuDoubleComplex c3, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cadd_hd(cadd_hd(cmul(c1,a[i]),cmul(c2,b[i])),cmul(c3,c[i]));
++}
++
++__global__ void qmrIncrem01Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                  cuDoubleComplex c, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) a[i] = cadd_hd(a[i],cmul(c,b[i]));
++}
++
++__global__ void qmrIncrem11DCKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
++                                    double c1, cuDoubleComplex c2, size_t n)
++{
++    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
++    if (i < n) {
++        const cuDoubleComplex r1 = make_cuDoubleComplex(c1*a[i].x,c1*a[i].y);
++        a[i] = cadd_hd(r1,cmul(c2,b[i]));
++    }
++}
++
++int launchChecked(const char *name)
++{
++    return failCuda(cudaGetLastError(),name);
++}
++
++
+ int createPlans()
+ {
+     const int gx = toInt(g.cfg.gridX,"gridX"); if (gx < 0) return -1;
+@@ -499,8 +622,10 @@
+     }
+     if (failCuda(cudaSetDevice(device),"cudaSetDevice")) { freeContext(); return -1; }
+ 
+-    if (failCuda(cudaEventCreate(&g.matvec_start),"cudaEventCreate(matvec start)") ||
+-        failCuda(cudaEventCreate(&g.matvec_stop),"cudaEventCreate(matvec stop)")) {
++    /* CUDA 11.8: cudaSetDevice() selects the device but does not necessarily
++     * create the primary context immediately.  Force runtime/context creation
++     * before any sizeable ADDA allocation. */
++    if (failCuda(cudaFree(nullptr),"CUDA 11.8 context initialization (cudaFree(0))")) {
+         freeContext();
+         return -1;
+     }
+@@ -513,6 +638,19 @@
+         return -1;
+     }
+ 
++    if (failCuda(cudaEventCreate(&g.matvec_start),"cudaEventCreate(matvec start)") ||
++        failCuda(cudaEventCreate(&g.matvec_stop),"cudaEventCreate(matvec stop)")) {
++        freeContext();
++        return -1;
++    }
++
++    /* Create library contexts/workspaces before the large ADDA allocations so
++     * CUDA/cuBLAS/cuFFT reserve what they need first. */
++    if (failCublas(cublasCreate(&g.cublas),"cublasCreate")) { freeContext(); return -1; }
++    if (failCublas(cublasSetPointerMode(g.cublas,CUBLAS_POINTER_MODE_HOST),
++                   "cublasSetPointerMode(HOST)")) { freeContext(); return -1; }
++    if (createPlans()) { freeContext(); return -1; }
++
+ #define CUDA_ALLOC(ptr,count,type,label) \
+     do { if (failCuda(cudaMalloc(reinterpret_cast<void**>(&(ptr)),(count)*sizeof(type)),label)) { freeContext(); return -1; } } while (0)
+ 
+@@ -520,8 +658,8 @@
+     if (cfg->surface) CUDA_ALLOC(g.d_R,g.rComplexCount,cuDoubleComplex,"cudaMalloc(Rmatrix)");
+     CUDA_ALLOC(g.d_material,cfg->ndip,unsigned char,"cudaMalloc(material)");
+     CUDA_ALLOC(g.d_position,cfg->nrows,unsigned short,"cudaMalloc(position)");
+-    CUDA_ALLOC(g.d_arg,cfg->nrows,cuDoubleComplex,"cudaMalloc(argvec)");
+-    CUDA_ALLOC(g.d_result,cfg->nrows,cuDoubleComplex,"cudaMalloc(resultvec)");
++    CUDA_ALLOC(g.d_arg,cfg->nrows,cuDoubleComplex,"cudaMalloc(argvec/QMR vector 0)");
++    CUDA_ALLOC(g.d_result,cfg->nrows,cuDoubleComplex,"cudaMalloc(resultvec/QMR vector 1)");
+     CUDA_ALLOC(g.d_grid,g.gridComplexCount,cuDoubleComplex,"cudaMalloc(full FFT grid)");
+     if (cfg->surface) CUDA_ALLOC(g.d_gridR,g.gridComplexCount,cuDoubleComplex,"cudaMalloc(surface FFT grid)");
+ #undef CUDA_ALLOC
+@@ -539,7 +677,6 @@
+         freeContext(); return -1;
+     }
+ 
+-    if (createPlans()) { freeContext(); return -1; }
+     g.initialized = true;
+     return 0;
+ }
+@@ -566,32 +703,16 @@
+                     "upload cc_sqrt");
+ }
+ 
+-extern "C" int adda_cuda_matvec_execute(const void *argvec, void *resultvec, int her,
+-                                         double *inprod, double *elapsed_ms)
++int matvecGpuCore(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, int her,
++                  double *inprod, double *elapsed_ms)
+ {
+-    g_error[0] = '\0';
+-    if (!g.initialized || g.d_cc == nullptr) {
+-        setError("CUDA MatVec or cc_sqrt is not initialized");
+-        return -1;
+-    }
+-    if (argvec == nullptr || resultvec == nullptr) {
+-        setError("null argument/result vector passed to CUDA MatVec");
+-        return -1;
+-    }
+-
+-    const size_t vectorBytes = g.cfg.nrows*sizeof(cuDoubleComplex);
+     const size_t gridBytes = g.gridComplexCount*sizeof(cuDoubleComplex);
+-    if (failCuda(cudaMemcpy(g.d_arg,argvec,vectorBytes,cudaMemcpyHostToDevice),"upload MatVec argument")) return -1;
+-
+-    /* The input copy above is intentionally before the start event.  The
+-     * output copy below is intentionally after the stop event.  Consequently
+-     * elapsed_ms covers the GPU grid reset, kernels and cuFFT calls only. */
+     if (failCuda(cudaEventRecord(g.matvec_start,0),"cudaEventRecord(matvec start)") ||
+         failCuda(cudaMemset(g.d_grid,0,gridBytes),"clear CUDA FFT grid")) return -1;
+ 
+     const int threads = 256;
+     const unsigned int dipBlocks = static_cast<unsigned int>((g.cfg.ndip + threads - 1)/threads);
+-    scatterKernel<<<dipBlocks,threads>>>(g.d_arg,g.d_grid,g.d_material,g.d_position,g.d_cc,
++    scatterKernel<<<dipBlocks,threads>>>(d_arg,g.d_grid,g.d_material,g.d_position,g.d_cc,
+                                         g.cfg.ndip,g.cfg.gridX,g.cfg.gridY,g.gridN,her != 0);
+     if (failCuda(cudaGetLastError(),"scatterKernel launch")) return -1;
+ 
+@@ -617,37 +738,255 @@
+                                CUFFT_INVERSE),
+                   "cufftExecZ2Z(3D inverse)")) return -1;
+ 
+-    gatherKernel<<<dipBlocks,threads>>>(g.d_arg,g.d_result,g.d_grid,g.d_material,g.d_position,g.d_cc,
++    gatherKernel<<<dipBlocks,threads>>>(d_arg,d_result,g.d_grid,g.d_material,g.d_position,g.d_cc,
+                                        g.cfg.ndip,g.cfg.gridX,g.cfg.gridY,g.gridN,her != 0);
+     if (failCuda(cudaGetLastError(),"gatherKernel launch")) return -1;
+ 
+-    if (failCuda(cudaEventRecord(g.matvec_stop,0),"cudaEventRecord(matvec stop)")) return -1;
+-    if (failCuda(cudaEventSynchronize(g.matvec_stop),"cudaEventSynchronize(matvec stop)")) return -1;
++    if (inprod != nullptr) {
++        if (g.cfg.nrows > static_cast<size_t>(INT_MAX)) {
++            setError("MatVec norm via cuBLAS requires nrows <= INT_MAX");
++            return -1;
++        }
++        double norm = 0.0;
++        if (failCublas(cublasDznrm2(g.cublas,static_cast<int>(g.cfg.nrows),d_result,1,&norm),
++                       "cublasDznrm2(MatVec result)")) return -1;
++        *inprod = norm*norm;
++    }
++
++    if (failCuda(cudaEventRecord(g.matvec_stop,0),"cudaEventRecord(matvec stop)") ||
++        failCuda(cudaEventSynchronize(g.matvec_stop),"cudaEventSynchronize(matvec stop)")) return -1;
+     if (elapsed_ms != nullptr) {
+         float elapsed_gpu_ms = 0.0f;
+-        if (failCuda(cudaEventElapsedTime(&elapsed_gpu_ms,
+-                                          g.matvec_start,g.matvec_stop),
++        if (failCuda(cudaEventElapsedTime(&elapsed_gpu_ms,g.matvec_start,g.matvec_stop),
+                      "cudaEventElapsedTime(matvec)")) return -1;
+         *elapsed_ms = static_cast<double>(elapsed_gpu_ms);
+     }
++    return 0;
++}
++
++extern "C" int adda_cuda_matvec_execute(const void *argvec, void *resultvec, int her,
++                                         double *inprod, double *elapsed_ms)
++{
++    g_error[0] = '\0';
++    if (!g.initialized || g.d_cc == nullptr) {
++        setError("CUDA MatVec or cc_sqrt is not initialized");
++        return -1;
++    }
++    if (argvec == nullptr || resultvec == nullptr) {
++        setError("null argument/result vector passed to CUDA MatVec");
++        return -1;
++    }
+ 
+-    /* This blocking D2H copy is the MatVec synchronization point.  Static data
+-     * stay on the device; only the Krylov input/output vectors cross PCIe each
+-     * iteration while ADDA's iterative solvers remain CPU-resident. */
+-    if (failCuda(cudaMemcpy(resultvec,g.d_result,vectorBytes,cudaMemcpyDeviceToHost),
+-                 "download MatVec result")) return -1;
++    const size_t vectorBytes = g.cfg.nrows*sizeof(cuDoubleComplex);
++    if (failCuda(cudaMemcpy(g.d_arg,argvec,vectorBytes,cudaMemcpyHostToDevice),
++                 "upload MatVec argument")) return -1;
++    if (matvecGpuCore(g.d_arg,g.d_result,her,inprod,elapsed_ms)) return -1;
++    return failCuda(cudaMemcpy(resultvec,g.d_result,vectorBytes,cudaMemcpyDeviceToHost),
++                    "download MatVec result");
++}
+ 
+-    if (inprod != nullptr) {
+-        /* Read through memcpy rather than C++ aliasing: resultvec is a C99
+-         * double-complex array in the production caller. */
+-        const unsigned char *raw = static_cast<const unsigned char*>(resultvec);
+-        double sum = 0.0;
+-        for (size_t i=0; i<g.cfg.nrows; ++i) {
+-            cuDoubleComplex r;
+-            std::memcpy(&r,raw+i*sizeof(cuDoubleComplex),sizeof(r));
+-            sum += r.x*r.x + r.y*r.y;
++extern "C" int adda_cuda_matvec_execute_gpu(const void *argvec_id, const void *resultvec_id, int her,
++                                             double *inprod, double *elapsed_ms)
++{
++    g_error[0] = '\0';
++    if (!g.initialized || g.d_cc == nullptr) {
++        setError("CUDA MatVec or cc_sqrt is not initialized");
++        return -1;
++    }
++    cuDoubleComplex *d_arg = qmrDeviceVector(argvec_id);
++    if (d_arg == nullptr) return -1;
++    cuDoubleComplex *d_result = qmrDeviceVector(resultvec_id);
++    if (d_result == nullptr) return -1;
++    if (d_arg == d_result) {
++        setError("MatVec_GPU input and output vectors must not alias");
++        return -1;
++    }
++    return matvecGpuCore(d_arg,d_result,her,inprod,elapsed_ms);
++}
++
++extern "C" int adda_cuda_qmr_init(const void *xvec, const void *rvec, const void *pvec,
++                                    const void *vec1, const void *vec2, const void *vec3,
++                                    const void *Avecbuffer)
++{
++    g_error[0] = '\0';
++    if (!g.initialized || g.cublas == nullptr) {
++        setError("CUDA backend is not initialized before QMR initialization");
++        return -1;
++    }
++    const void *host[Context::QMR_VECTOR_COUNT] = {xvec,rvec,pvec,vec1,vec2,vec3,Avecbuffer};
++    for (int i=0; i<Context::QMR_VECTOR_COUNT; ++i) {
++        if (host[i] == nullptr) { setError("null vector passed to CUDA QMR initialization"); return -1; }
++        for (int j=0; j<i; ++j) {
++            if (host[i] == host[j]) { setError("CUDA QMR vector identities must be distinct"); return -1; }
++        }
++    }
++    if (g.cfg.nrows > static_cast<size_t>(INT_MAX)) {
++        setError("CUDA QMR requires nrows <= INT_MAX for cuBLAS");
++        return -1;
++    }
++    if (g.d_qmr_extra == nullptr) {
++        size_t total;
++        if (!checkedMul(static_cast<size_t>(Context::QMR_EXTRA_VECTOR_COUNT),g.cfg.nrows,total)) {
++            setError("overflow while allocating CUDA QMR vectors");
++            return -1;
+         }
+-        *inprod = sum;
++        if (failCuda(cudaMalloc(reinterpret_cast<void**>(&g.d_qmr_extra),total*sizeof(cuDoubleComplex)),
++                     "cudaMalloc(QMR extra vectors)")) return -1;
++    }
++    for (int i=0; i<Context::QMR_VECTOR_COUNT; ++i) g.qmr_host[i]=host[i];
++    g.qmr_device[0]=g.d_arg;
++    g.qmr_device[1]=g.d_result;
++    for (int i=2; i<Context::QMR_VECTOR_COUNT; ++i)
++        g.qmr_device[i]=g.d_qmr_extra + static_cast<size_t>(i-2)*g.cfg.nrows;
++    g.qmr_initialized = true;
++    return adda_cuda_qmr_upload_all();
++}
++
++extern "C" int adda_cuda_qmr_upload_all(void)
++{
++    g_error[0] = '\0';
++    if (!g.qmr_initialized || g.d_qmr_extra == nullptr) { setError("CUDA QMR is not initialized"); return -1; }
++    const size_t bytes = g.cfg.nrows*sizeof(cuDoubleComplex);
++    for (int i=0; i<Context::QMR_VECTOR_COUNT; ++i) {
++        if (failCuda(cudaMemcpy(g.qmr_device[i],g.qmr_host[i],bytes,
++                                cudaMemcpyHostToDevice),"upload QMR vector")) return -1;
++    }
++    return 0;
++}
++
++extern "C" int adda_cuda_qmr_download_all(void)
++{
++    g_error[0] = '\0';
++    if (!g.qmr_initialized || g.d_qmr_extra == nullptr) { setError("CUDA QMR is not initialized"); return -1; }
++    const size_t bytes = g.cfg.nrows*sizeof(cuDoubleComplex);
++    for (int i=0; i<Context::QMR_VECTOR_COUNT; ++i) {
++        if (failCuda(cudaMemcpy(const_cast<void*>(g.qmr_host[i]),
++                                g.qmr_device[i],bytes,
++                                cudaMemcpyDeviceToHost),"download QMR vector")) return -1;
++    }
++    return 0;
++}
++
++extern "C" int adda_cuda_qmr_dotu(const void *a_id, const void *b_id,
++                                    double *out_re, double *out_im)
++{
++    g_error[0] = '\0';
++    if (out_re == nullptr || out_im == nullptr) { setError("null QMR dot-product result pointer"); return -1; }
++    cuDoubleComplex *a=qmrDeviceVector(a_id); if (a==nullptr) return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if (b==nullptr) return -1;
++    cuDoubleComplex out{};
++    if (failCublas(cublasZdotu(g.cublas,static_cast<int>(g.cfg.nrows),a,1,b,1,&out),
++                   "cublasZdotu(QMR)")) return -1;
++    *out_re=out.x; *out_im=out.y;
++    return 0;
++}
++
++extern "C" int adda_cuda_qmr_dotu_self_norm2(const void *a_id,
++                                               double *out_re, double *out_im,
++                                               double *norm2)
++{
++    g_error[0] = '\0';
++    if (out_re == nullptr || out_im == nullptr || norm2 == nullptr) {
++        setError("null QMR dot/norm result pointer"); return -1;
++    }
++    cuDoubleComplex *a=qmrDeviceVector(a_id); if (a==nullptr) return -1;
++    cuDoubleComplex out{};
++    double norm=0.0;
++    if (failCublas(cublasZdotu(g.cublas,static_cast<int>(g.cfg.nrows),a,1,a,1,&out),
++                   "cublasZdotu(QMR self)")) return -1;
++    if (failCublas(cublasDznrm2(g.cublas,static_cast<int>(g.cfg.nrows),a,1,&norm),
++                   "cublasDznrm2(QMR self)")) return -1;
++    *out_re=out.x; *out_im=out.y; *norm2=norm*norm;
++    return 0;
++}
++
++static int qmrBlocks(unsigned int *blocks)
++{
++    const int threads=256;
++    const size_t b=(g.cfg.nrows + static_cast<size_t>(threads)-1)/static_cast<size_t>(threads);
++    if (b > static_cast<size_t>(UINT_MAX)) { setError("QMR vector is too large for CUDA launch grid"); return -1; }
++    *blocks=static_cast<unsigned int>(b);
++    return 0;
++}
++
++extern "C" int adda_cuda_qmr_mult(const void *a_id, const void *b_id, double cr, double ci)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrMultKernel<<<blocks,256>>>(a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
++    return launchChecked("qmrMultKernel launch");
++}
++
++extern "C" int adda_cuda_qmr_mult_self(const void *a_id, double cr, double ci)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1; unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrMultSelfKernel<<<blocks,256>>>(a,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
++    return launchChecked("qmrMultSelfKernel launch");
++}
++
++extern "C" int adda_cuda_qmr_lincomb1(const void *a_id, const void *b_id, const void *c_id,
++                                        double c1r, double c1i)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; cuDoubleComplex *c=qmrDeviceVector(c_id); if(!c)return -1;
++    unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrLinComb1Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),g.cfg.nrows);
++    return launchChecked("qmrLinComb1Kernel launch");
++}
++
++extern "C" int adda_cuda_qmr_lincomb(const void *a_id, const void *b_id, const void *c_id,
++                                       double c1r, double c1i, double c2r, double c2i)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; cuDoubleComplex *c=qmrDeviceVector(c_id); if(!c)return -1;
++    unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrLinCombKernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
++    return launchChecked("qmrLinCombKernel launch");
++}
++
++extern "C" int adda_cuda_qmr_increm110(const void *a_id, const void *b_id, const void *c_id,
++                                         double c1r, double c1i, double c2r, double c2i)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; cuDoubleComplex *c=qmrDeviceVector(c_id); if(!c)return -1;
++    unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrIncrem110Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
++    return launchChecked("qmrIncrem110Kernel launch");
++}
++
++extern "C" int adda_cuda_qmr_increm111(const void *a_id, const void *b_id, const void *c_id,
++                                         double c1r, double c1i, double c2r, double c2i,
++                                         double c3r, double c3i)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; cuDoubleComplex *c=qmrDeviceVector(c_id); if(!c)return -1;
++    unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrIncrem111Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),
++                                      make_cuDoubleComplex(c3r,c3i),g.cfg.nrows);
++    return launchChecked("qmrIncrem111Kernel launch");
++}
++
++extern "C" int adda_cuda_qmr_increm01(const void *a_id, const void *b_id, double cr, double ci)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrIncrem01Kernel<<<blocks,256>>>(a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
++    return launchChecked("qmrIncrem01Kernel launch");
++}
++
++extern "C" int adda_cuda_qmr_increm11_d_c(const void *a_id, const void *b_id,
++                                            double c1, double c2r, double c2i,
++                                            double *norm2)
++{
++    g_error[0]='\0'; cuDoubleComplex *a=qmrDeviceVector(a_id); if(!a)return -1;
++    cuDoubleComplex *b=qmrDeviceVector(b_id); if(!b)return -1; unsigned int blocks; if(qmrBlocks(&blocks))return -1;
++    qmrIncrem11DCKernel<<<blocks,256>>>(a,b,c1,make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
++    if (launchChecked("qmrIncrem11DCKernel launch")) return -1;
++    if (norm2 != nullptr) {
++        double norm=0.0;
++        if (failCublas(cublasDznrm2(g.cublas,static_cast<int>(g.cfg.nrows),a,1,&norm),
++                       "cublasDznrm2(QMR residual)")) return -1;
++        *norm2=norm*norm;
+     }
+     return 0;
+ }
+--- /mnt/data/cudamatvec_backend.h	2026-08-26 19:01:31.423776874 +0000
++++ src/cudamatvec_backend.h	2026-08-26 19:15:53.526012631 +0000
+@@ -1,9 +1,9 @@
+-/* Low-level CUDA backend for ADDA MatVec.
++/* Low-level CUDA backend for ADDA MatVec and CUDA-resident QMR primitives.
+  *
+  * This header deliberately uses only C ABI/POD types.  The main ADDA code uses
+- * C99 double complex, while CUDA sources are compiled as C++.  C99 guarantees
+- * that double complex has the same representation as two adjacent doubles;
+- * cudamatvec_backend.cu verifies the matching CUDA representation at compile time.
++ * C99 double complex, while CUDA sources are compiled as C++.  Complex vectors
++ * are passed as opaque pointers; complex scalar values cross the DLL boundary
++ * as separate real/imaginary doubles.
+  */
+ #ifndef ADDA_CUDAMATVEC_BACKEND_H
+ #define ADDA_CUDAMATVEC_BACKEND_H
+@@ -28,26 +28,60 @@
+     int device; /* < 0: use ADDA_CUDA_DEVICE or CUDA device 0 */
+ } AddaCudaMatVecConfig;
+ 
+-/* Static data (D/R, material, positions) are copied once by init and remain
+- * resident until adda_cuda_matvec_free().  Complex pointers refer to packed
+- * pairs of doubles in ADDA's C99 double-complex representation. */
+ int adda_cuda_matvec_init(const AddaCudaMatVecConfig *cfg,
+                           const void *Dmatrix,
+                           const void *Rmatrix,
+                           const unsigned char *material,
+                           const unsigned short *position);
+ 
+-/* cc_sqrt changes between incident-polarization solves, but not between Krylov
+- * iterations.  It is therefore uploaded explicitly by InitCC, not by MatVec. */
+ int adda_cuda_matvec_update_cc(const void *cc_sqrt, size_t complex_count);
+ 
+-/* Executes one MatVec.  argvec and resultvec contain cfg.nrows complex values.
+- * If inprod is non-NULL, the squared norm of resultvec is returned.  If
+- * elapsed_ms is non-NULL, it receives the GPU elapsed time in milliseconds,
+- * excluding the host-to-device input and device-to-host output copies. */
++/* CPU-facing MatVec: upload input, execute the GPU core, download output. */
+ int adda_cuda_matvec_execute(const void *argvec, void *resultvec, int her,
+                              double *inprod, double *elapsed_ms);
+ 
++/* CUDA-resident MatVec.  The two arguments are host pointer identities that
++ * must previously have been registered by adda_cuda_qmr_init().  No H2D/D2H
++ * vector copy is performed by this call. */
++int adda_cuda_matvec_execute_gpu(const void *argvec_id, const void *resultvec_id,
++                                 int her, double *inprod, double *elapsed_ms);
++
++/* Register the seven vectors used by QMR_CS and upload their current host
++ * values.  The host pointers are thereafter used only as stable identities;
++ * vector arithmetic and MatVec_GPU use their associated device allocations. */
++int adda_cuda_qmr_init(const void *xvec, const void *rvec, const void *pvec,
++                       const void *vec1, const void *vec2, const void *vec3,
++                       const void *Avecbuffer);
++int adda_cuda_qmr_upload_all(void);
++int adda_cuda_qmr_download_all(void);
++
++/* QMR scalar reductions.  dotu computes sum(a[i]*b[i]), i.e. no conjugation.
++ * dotu_norm2(a,a) returns both sum(a[i]*a[i]) and ||a||^2. */
++int adda_cuda_qmr_dotu(const void *a_id, const void *b_id,
++                       double *out_re, double *out_im);
++int adda_cuda_qmr_dotu_self_norm2(const void *a_id,
++                                  double *out_re, double *out_im,
++                                  double *norm2);
++
++/* QMR vector kernels. Complex coefficients are passed as re/im pairs. */
++int adda_cuda_qmr_mult(const void *a_id, const void *b_id,
++                       double cr, double ci);
++int adda_cuda_qmr_mult_self(const void *a_id, double cr, double ci);
++int adda_cuda_qmr_lincomb1(const void *a_id, const void *b_id, const void *c_id,
++                           double c1r, double c1i);
++int adda_cuda_qmr_lincomb(const void *a_id, const void *b_id, const void *c_id,
++                          double c1r, double c1i, double c2r, double c2i);
++int adda_cuda_qmr_increm110(const void *a_id, const void *b_id, const void *c_id,
++                            double c1r, double c1i, double c2r, double c2i);
++int adda_cuda_qmr_increm111(const void *a_id, const void *b_id, const void *c_id,
++                            double c1r, double c1i, double c2r, double c2i,
++                            double c3r, double c3i);
++int adda_cuda_qmr_increm01(const void *a_id, const void *b_id,
++                           double cr, double ci);
++int adda_cuda_qmr_increm11_d_c(const void *a_id, const void *b_id,
++                               double c1, double c2r, double c2i,
++                               double *norm2);
++
+ void adda_cuda_matvec_free(void);
+ const char *adda_cuda_matvec_last_error(void);
+ 
+--- /mnt/data/cudamatvec_backend.def	2026-08-26 19:01:31.219777931 +0000
++++ src/cudamatvec_backend.def	2026-08-26 19:15:53.527393770 +0000
+@@ -3,5 +3,19 @@
+     adda_cuda_matvec_init
+     adda_cuda_matvec_update_cc
+     adda_cuda_matvec_execute
++    adda_cuda_matvec_execute_gpu
++    adda_cuda_qmr_init
++    adda_cuda_qmr_upload_all
++    adda_cuda_qmr_download_all
++    adda_cuda_qmr_dotu
++    adda_cuda_qmr_dotu_self_norm2
++    adda_cuda_qmr_mult
++    adda_cuda_qmr_mult_self
++    adda_cuda_qmr_lincomb1
++    adda_cuda_qmr_lincomb
++    adda_cuda_qmr_increm110
++    adda_cuda_qmr_increm111
++    adda_cuda_qmr_increm01
++    adda_cuda_qmr_increm11_d_c
+     adda_cuda_matvec_free
+     adda_cuda_matvec_last_error
+--- /mnt/data/build_cuda_backend.bat	2026-08-26 19:01:31.423776874 +0000
++++ scripts/build_cuda_backend.bat	2026-08-26 19:19:18.989863527 +0000
+@@ -6,7 +6,7 @@
+ rem
+ rem ADDA itself is NOT compiled here.  CMake/CLion continues to use MinGW/GCC.
+ rem This script performs:
+-rem   1) nvcc + MSVC host compiler -> cuda-backend\adda_cuda_backend.dll
++rem   1) nvcc + MSVC host compiler -> cuda-backend\adda_cuda_backend.dll (cuFFT + cuBLAS)
+ rem   2) MinGW dlltool             -> cuda-backend\libadda_cuda_backend.a
+ rem
+ rem Usage:
+@@ -102,6 +102,7 @@
+     -I"%ROOT%\src" ^
+     "%SRC%" ^
+     -lcufft ^
++    -lcublas ^
+     -Xlinker "/DEF:%DEF%" ^
+     -Xlinker "/IMPLIB:%MSVCLIB%" ^
+     -o "%DLL%"

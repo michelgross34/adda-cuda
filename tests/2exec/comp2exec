@@ -1,0 +1,649 @@
+#!/bin/bash
+# Copyright (C) ADDA contributors
+# GNU General Public License version 3
+#
+# Performs system (black-box) testing of ADDA by comparing the simulation results between different versions/modes
+# --First parameter-- is seq (default), mpi, mpi_seq, ocl, or ocl_seq.
+# One-word mode compares corresponding current version with previous stable version (e.g. 1.0) - some differences are
+# expected. However, they can be silenced by proper tuning of CMDIGNORE and OLDIGNORE. Moreover, these modes require a 
+# reference executable of ADDA. The latter is available out of the box on Windows, but need to be separately compiled
+# on other systems. 
+# Two-word mode compares two current versions corresponding to different modes (e.g. mpi vs. seq) - only minor
+# differences are expected (and can also be silenced by fine-tuning).
+# --Second-- (if given) specifies file with a test suite (default - "suite").
+# --Third-- (if given) specifies bash pattern (best if quoted). Tests are started only from the command line that
+# matches it (convenient to restart the test suite from a break point).
+#
+# Also extra params (from the list EXTRAS below) can be included at any position, overriding setting inside this file:
+# 'NAME' sets the flag to 1
+# 'NAME=val' sets the parameter to val
+# 'NAME=' sets the flag to "", effectively disabling it
+# If used as one of the first three arguments, the corresponding parameter (described above) is set to the default value
+# ----------------------------------------
+# There are a lot of parameters to be tuned below. Look, at least, at REFPATH, CMDIGNORE, OLDIGNORE, and GPU
+# The rest may, in some cases, work out of box.
+# If you are tuning the tests after an update of ADDA, it is recommended to have more interactive execution by
+# uncommenting GUIDIFF below
+# ----------------------------------------
+# All significant differences obtained during tests go to stderr, so one may look mostly at this stream to catch
+# failures (redirect it to file or to colorize it in the terminal)
+# GitBash under Windows has issues with output due to line endings in suite*. Can be solved by dos2unix
+
+# first line is exclusive flags (use at most one together with manual definitions below)
+FLAGS="SPA_EXT SPA_STAN SURF_EXT SURF_STAN RD_EXT RD_STAN RD_TRICKY"
+# second - independent flags and internal variables
+EXTRAS="$FLAGS FFTCOMP GUIDIFF REFPATH ADDASEQ ADDAMPI ADDAOCL ADDASPASEQ ADDASPAMPI ADDASPAOCL OLDIGNORE"
+
+# ----- exclusive flags START -----
+# In the following the exclusive flags are described. You can uncomment them or define from the command line (see 
+# above), but at most one can be defined in total during any run (otherwise the behavior is not defined).
+ 
+# SPA_EXT indicates that sparse mode is extensively compared with sparse. SPA_STAN - that sparse is compared with
+# standard (both for test version, automatically implies FFTCOMP below).
+#SPA_EXT=1
+#SPA_STAN=1
+
+# Extensive testing of surface (in combination with all other options) and special mode for comparing surface mode
+# (with surface refractive index = 1) with standard (in the latter mode both are from test version).
+#SURF_EXT=1
+#SURF_STAN=1
+
+# Three testing options for rectangular dipoles. First, tests it in combination with all other options, second - tests 
+# the trivial case, third - tests that the result is not very different using a slightly different rectangular grid.
+# For the second and third cases only test version is tested
+# RD_EXT    -- test and ref command lines will be prefixed with '-rect_dip 1 1 2'
+# RD_STAN   -- test + '-rect_dip 1 1 1' 
+#                      ref(=test)  + '-pol cldr'
+# RD_TRICKY -- test + '-rect_dip 1 1 1.142857 -pol igt_so -int igt 3'
+#                      ref(=test)  + '-pol igt_so -int igt 3'
+#                      additionally high tolerance to numeric differences and '-size 5' is added in many cases
+#RD_EXT=1
+#RD_STAN=1
+#RD_TRICKY=1
+
+# ----- exclusive flags END -----
+# In the following we desribe flags and parameters that can be controlled independently of each other and flags above
+
+# Set the following flag to ignore differences related to different FFT methods, such as FFT grid sizes and memory.
+# Also useful for comparison of sparse version with the standard one (set automatically in that case)
+#FFTCOMP=1
+
+# Using a GUI diff program allows quick estimate of the importance of differences (e.g. when there are differences in 
+# minor digits of many numbers). However, most effort should be put in improving mycmp below, so that only significant 
+# errors remain.
+# GUIDIFF is a flag enabling use of GUI diff. If it is set to 'strip', stripped files are used for comparison. If used,
+# the existing program must be specified by GUIDIFFPROG. Options include, for example: tortoisegitmerge, meld, vimdiff
+#GUIDIFF=strip
+GUIDIFFPROG=tortoisegitmerge
+
+# Look below for "!!!", which mark the places where adjustments are probably need to be done
+
+#---------------- Set parameters and define internal functions ---------------------------------------------------------
+
+echo "----------------------------------------"
+echo "----==== ADDA system test ====----------"
+echo "----------------------------------------"
+# Location of sample input files (not needed if all input files are already present)
+INPUTDIR="./../../input"
+# Location of binaries
+ADDASEQ="./../../src/seq/adda"
+ADDASPASEQ="./../../src/seq/adda_spa"
+ADDAMPI="./../../src/mpi/adda_mpi"
+ADDASPAMPI="./../../src/mpi/adda_spa_mpi"
+ADDAOCL="./../../src/ocl/adda_ocl"
+ADDASPAOCL="./../../src/ocl/adda_spa_ocl" # this combination is not yet supported
+# Following two variable determine what is ignored when comparing against older executables. CMDIGNORE skipps the whole
+# runs (matches command line), OLDIGNORE - specifies lines in output files to be skipped
+# Currently formulated to compare 1.5* with 1.4.0 (more specific exceptions are added in parsing of command lines)
+# These variables must be updated whenever new features are added to ADDA
+
+CMDIGNORE="coated2|onion|superellipsoid|-h anisotr|-h int|-h pol|-h rect_dip|-h scat|-int igt_so|-h beam|-h m|-V"
+CMDIGNORE="$CMDIGNORE|-beam bessel|-surf 0.5|-surf 4 5 2|1e-16|-h shape line|-h jagged|-h save_geom|-h store_force"
+CMDIGNORE="$CMDIGNORE|-h no_vol_cor"
+OLDIGNORE="^ADDA v\.|^Copyright \(C\) 2006-20|^  coated2|^  onion|^  superellipsoid|^  -int|^  -pol|^  -scat"
+OLDIGNORE="$OLDIGNORE|^Incident beam center position:|^Incident beam: point dipole|^  -beam_center|Center position:"
+OLDIGNORE="$OLDIGNORE|^parameters of predefined shapes"
+
+# Path to reference binaries, examples: "." or "./../../win64". 
+# This may work out of the box on Windows, but requires changes for other systems
+REFPATH=./../../win64
+# MPI command prefix
+MPIRUN="mpiexec -n 4"
+# Choice of gpu (OpenCL device), if more than one
+#GPU="-gpu 1"
+# Find and process extra flags/params
+for arg in "$@"; do
+  for word in $EXTRAS; do
+    if [[ "$arg" == "$word" ]]; then
+      eval "${word}=1"
+    fi
+    if [[ "$arg" == "${word}="* ]]; then
+      eval "${arg}"
+    fi
+  done
+done
+ACTIVE_FLAGS=""
+for word in $FLAGS; do
+  if [ -n "${!word}" ]; then
+    ACTIVE_FLAGS="$ACTIVE_FLAGS $word"
+  fi
+done
+if [ -n "$ACTIVE_FLAGS" ]; then
+  echo "active flags:$ACTIVE_FLAGS"
+fi
+
+# whether older version is used for comparison; some errors are automatically ignored in many cases below
+OLDUSED=1
+# SPA_* flags change links to ADDA executables
+if [[ -n "$SPA_EXT" || -n "$SPA_STAN" ]]; then
+  DEFSUITE=suite_sparse
+  SEQTEST="$ADDASPASEQ"
+  MPITEST="$ADDASPAMPI"
+  OCLTEST="$ADDASPAOCL" # this combination is not yet supported
+  if [ -n "$SPA_EXT" ]; then
+    SEQREF="$REFPATH/adda_spa" # !!! This may be adjusted
+    MPIREF="$REFPATH/adda_spa_mpi" # !!! This may be adjusted
+    OCLREF="$REFPATH/adda_spa_ocl" # !!! This may be adjusted; this combination is not yet supported
+  else # SPA_STAN
+    FFTCOMP=1
+    OLDUSED=""
+    SEQREF="$ADDASEQ"
+    MPIREF="$ADDAMPI"
+    OCLREF="$ADDAOCL"
+  fi
+else
+  DEFSUITE=suite
+  SEQTEST="$ADDASEQ"
+  MPITEST="$ADDAMPI"
+  OCLTEST="$ADDAOCL"
+  SEQREF="$REFPATH/adda" # !!! This may be adjusted
+  MPIREF="$REFPATH/adda_mpi" # !!! This may be adjusted
+  OCLREF="$REFPATH/adda_ocl" # !!! This may be adjusted
+fi
+# Other flags modify suffixes
+if [ -n "$SURF_EXT" ]; then
+  DEFSUITE=suite_surf
+  SUFREF="-surf 4 2 0.1"
+  SUFTEST="$SUFREF"
+fi
+if [ -n "$SURF_STAN" ]; then
+  DEFSUITE=suite_surf
+  REF_EQ_TEST=1 # ref executable is the same as test one
+  SUFTEST="-surf 10 1 0 -yz"
+fi
+if [ -n "$RD_EXT" ]; then
+  DEFSUITE=suite_rd
+  SUFREF="-rect_dip 1 1 2"
+  SUFTEST="$SUFREF"
+fi
+if [ -n "$RD_STAN" ]; then
+  DEFSUITE=suite_rd
+  REF_EQ_TEST=1
+  SUFREF="-pol cldr"
+  SUFTEST="-rect_dip 1 1 1"
+fi
+if [ -n "$RD_TRICKY" ]; then
+  DEFSUITE=suite_rd
+  REF_EQ_TEST=1
+  SUFREF="-pol igt_so -int igt 3"
+  SUFTEST="-rect_dip 1 1 1.142857 -pol igt_so -int igt 3"
+fi
+if [ -n "$REF_EQ_TEST" ]; then
+  OLDUSED=""
+fi
+
+function is_extra {
+  # returns 0 (true) if the argument matches one of EXTRAS or is blank 
+  local word
+  if [ -n "$1" ]; then
+    for word in $EXTRAS; do
+      if [[ "$1" == "$word"* ]]; then
+        return 0
+      fi
+    done
+    return 1
+  fi
+  return 0 # redundant
+}
+function set_default {
+  # sets variable named $1 either to $2 (if neither in EXTRAS nor blank) or to $3 (default)
+  if is_extra "$2"; then
+    eval $1="'$3'"
+  else
+    eval $1="'$2'"
+  fi
+}
+function assign_test {
+  # tests sets variable named $1 either to $3 (if $2 is nonblank) or to $4 (a = b ? c : d)
+  if [ -n "$2" ]; then
+    eval $1="'$3'"
+  else
+    eval $1="'$4'"
+  fi
+}
+
+set_default MODE "$1" seq
+if [ $MODE == "seq" ]; then
+  assign_test EXECREF "$REF_EQ_TEST" "$SEQTEST" "$SEQREF"
+  EXECREF="$EXECREF $SUFREF"
+  EXECTEST="$SEQTEST $SUFTEST"
+elif [ $MODE == "mpi" ]; then
+  assign_test EXECREF "$REF_EQ_TEST" "$MPITEST" "$MPIREF"
+  EXECREF="$MPIRUN $EXECREF $SUFREF"
+  EXECTEST="$MPIRUN $MPITEST $SUFTEST"
+elif [ $MODE == "mpi_seq" ]; then
+  assign_test EXECREF "$SPA_STAN" "$SEQREF" "$SEQTEST"
+  OLDUSED=""
+  EXECREF="$EXECREF $SUFREF"
+  EXECTEST="$MPIRUN $MPITEST $SUFTEST"
+elif [ $MODE == "ocl" ]; then
+  assign_test EXECREF "$REF_EQ_TEST" "$OCLTEST" "$OCLREF"
+  EXECREF="$EXECREF $GPU $SUFREF"
+  EXECTEST="$OCLTEST $GPU $SUFTEST"
+elif [ $MODE == "ocl_seq" ]; then
+  assign_test EXECREF "$SPA_STAN" "$SEQREF" "$SEQTEST"
+  OLDUSED=""
+  EXECREF="$EXECREF $SUFREF"
+  EXECTEST="$OCLTEST $GPU $SUFTEST"
+else
+  echo -e "\nERROR: unkwnown mode '$MODE'" >&2
+  exit 1
+fi
+echo "mode: '$MODE'"
+
+set_default SUITEFILE "$2" "$DEFSUITE"
+echo "suite file: '$SUITEFILE'"
+
+if [ -n "$OLDUSED" ]; then
+  echo "Comparing against older executable"
+fi
+
+DIRREF=out_ref # directory names to place ADDA output
+DIRTEST=out_test
+SOREF=stdout_ref  # name of files in which stdout is redirected
+SOTEST=stdout_test
+SONAME=stdout # denotes 'stdout' in suite file
+ALLNAME=all # denotes that all output files should be compared (in suite file)
+TMPREF=ref.tmp # temporary files for text processing
+TMPTEST=test.tmp
+
+# If you encounter errors of awk, try changing the following to gawk
+AWK=awk
+
+function append {
+  # appends variable named $1 by pattern $2, and takes care that no empty parts appear
+  if [ -n "$2" ]; then
+    if [ -n "${!1}" ]; then
+      # use " inside to allow variable expansion; for consistency the same is used in the other case
+      eval $1="\"\$$1|$2\""
+    else
+      eval $1="\"$2\""
+    fi
+  fi
+  eval 
+}
+function cleanfile {
+  # Processes file $1 and stores the result in $2. Basic step is removing lines matching regexp $3. Additional optional
+  # step is cutting the end of the file starting from line matching regexp $4.
+  if [ -n "$3" ]; then
+    if [ -n "$4" ]; then
+      $AWK "BEGIN{p=1} /$4/{p=0} p" $1 | grep -v -E -e "$3" > $2
+    else
+      grep -v -E -e "$3" $1 > $2
+      # Useful for debugging
+      if [ ! -s $2 ]; then
+        echo "ERROR in ignore pattern" >&2
+        exit 1
+      fi
+    fi
+  else # trivial case
+    cp $1 $2
+  fi
+  cleaned=1
+}
+function numdiff {
+  # Performs comparison of two files, ignoring differences in numerical values smaller than absolute and relative
+  # tolerances, specified by variables atol and rtol (-log of real value). The main logic is inside awk script
+  # 'diff_numeric'.
+  diff $1 $2 | $AWK -f diff_numeric.awk -v abs_tol=1e-$atol -v rel_tol=1e-$rtol -  >&2
+}
+function numigndiff {
+  # Same as numdiff, but additionally ignores certain differences in input files - see description of function cleanfile
+  cleanfile $1 $TMPREF "$3" "$4"
+  cleanfile $2 $TMPTEST "$3" "$4"
+  diff $TMPREF $TMPTEST | $AWK -f diff_numeric.awk -v abs_tol=1e-$atol -v rel_tol=1e-$rtol -  >&2
+}
+function igndiff {
+  # Performs comparison of two files, ignoring differences in lines matching regexp $3 and all the differences after the
+  # line matching regexp $4.
+  cleanfile $1 $TMPREF "$3" "$4"
+  cleanfile $2 $TMPTEST "$3" "$4"
+  diff $TMPREF $TMPTEST >&2
+}
+function asmin {
+  # Assign variable named $1 to $2 if its current value is larger
+  if [[ -z ${!1} || ${!1} -gt $2 ]]; then
+    eval $1=$2
+  fi
+}
+function mycmp {
+  # Determines which differences are considered significant, depending on files. Use of $ at the end of ignore patterns
+  # seems to be not portable, since it does not work on Windows because of different EOL style. So we skip it for now.
+  # Sets non-zero status if difference is found (all called *diff functions work this way)
+
+  # First, set default numerical accuracy or adjust it based on cmdline
+  atol=16
+  rtol=16
+  if [[ "$cmdline" == -granul\ * ]]; then
+    asmin atol 1
+    asmin rtol 2
+  elif [ -z "$cmdline" ]; then
+    # we want to always compare empty command line to address defaults, but the tolerances are required to be larger
+    # especially, if we want to keep it for all possible modes
+    asmin atol 3
+    asmin rtol 2
+  else
+    asmin atol 14
+    asmin rtol 8
+  fi
+  if [ -n "$RD_TRICKY" ]; then
+    asmin atol 5
+    asmin rtol 2
+  fi
+  # behavior is mainly determined by file name
+  base=`basename $1`
+  IGNORE=""
+  if [ -n "$OLDUSED" ]; then
+    append IGNORE "$OLDIGNORE"
+    # The following is specific for reference version 1.4.0
+    if [[ "$cmdline" == *"-int igt 3"* ]]; then
+       asmin rtol 6
+    fi    
+  fi
+  if [ "$base" == $SONAME ]; then
+    append IGNORE "^all data is saved in '.*'|No real dipoles are assigned"
+    if [[ -n "$RD_STAN" || -n "$RD_TRICKY" ]]; then
+      append IGNORE "^Dipole size:|^lambda:|^CoupleConstant:"
+      if [ -n "$RD_TRICKY" ]; then
+        append IGNORE "^box dimensions:|^Total number of occupied dipoles:|^(M|Total m|OpenCL m|Maximum m)emory usage"
+      fi      
+    fi
+    if [ -n "$FFTCOMP" ]; then
+      append IGNORE "^(M|Total m|OpenCL m|Maximum m)emory usage|^Initializing (clFFT|FFTW3)"
+    fi
+    if [ $MODE == "mpi_seq" ]; then
+      append IGNORE "^(M|Total m|Maximum m|Additional m)emory usage"
+    elif [ $MODE == "ocl_seq" ]; then
+      # double definition to wrap line
+      append IGNORE "^Using OpenCL device|^Device memory|^Searching for OpenCL devices|^Initializing (clFFT|FFTW3)"
+      append IGNORE "^(M|Total m|OpenCL m)emory usage"
+    fi
+    if [ -n "$FFTCOMP" ]; then
+      append IGNORE "^(M|Total m|OpenCL m|Maximum m)emory usage|^Initializing (clFFT|FFTW3)"
+    fi
+    if [ -n "$SPA_STAN" ]; then
+      append IGNORE "^Calculating( reflected|) Green's function|^Fourier transform of"
+    fi
+    if [ -n "$SURF_STAN" ]; then
+      append IGNORE "^Calculating (table|reflected)|^Fourier transform of Rmatrix"
+      append IGNORE "^Surface|^(M|Total m|OpenCL m|Maximum m)emory usage"
+    fi
+    CUT=""
+    if [[ -n "$RD_TRICKY" || -z "$cmdline" ]] ; then
+      append CUT "^here we go"
+    fi
+    if [[ $MODE == "mpi" || $MODE == "mpi_seq" ]]; then
+      append IGNORE "No real voxels are assigned"  # these can appear at arbitrary positions in the output
+      append CUT "^Error posting writev, " # due to typical random errors of MPICH under Windows
+    fi
+    asmin rtol 4
+    numigndiff $1 $2 "$IGNORE" "$CUT"
+  elif [ "$base" == $SOREF ]; then
+    if [[ $MODE == "mpi" || $MODE == "mpi_seq" ]]; then
+      CUT="^Error posting writev, " # due to typical random errors of MPICH under Windows
+    else
+      CUT=""
+    fi
+    append IGNORE "^Usage: '.*'|^Type '.*' for details"
+    igndiff $1 $2 "$IGNORE" "$CUT"
+  elif [ "$base" == "log" ]; then
+    append IGNORE "^Generated by ADDA v\.|^command: '.*'"
+    if [[ -n "$RD_STAN" || -n "$RD_TRICKY" ]]; then
+      append IGNORE "^Dipole size:|^Dipoles/lambda:|^CoupleConstant:"
+      if [ -n "$RD_TRICKY" ]; then
+        append IGNORE "^box dimensions:|^Total number of occupied dipoles:"
+        append IGNORE "^The FFT grid is:|^(M|Total m|OpenCL m|Maximum m)emory usage"
+      fi      
+    fi
+    if [ $MODE == "mpi_seq" ]; then
+      append IGNORE "^The program was run on:|^(M|Total m|Maximum m|Additional m)emory usage|^The FFT grid is:"
+    elif [ $MODE == "ocl_seq" ]; then
+      append IGNORE "^Using OpenCL device|^Device memory|^OpenCL FFT algorithm:|^(M|Total m|OpenCL m)emory usage"
+    fi
+    if [ -n "$FFTCOMP" ]; then
+      append IGNORE "^(|OpenCL )FFT algorithm:|^The FFT grid is:|^(M|Total m|OpenCL m|Maximum m)emory usage"
+    fi
+    if [ -n "$SURF_STAN" ]; then
+      append IGNORE "^Particle is placed|^  height of the|^Reflected|^Transmitted|^Total planes of E"
+      append IGNORE "^(M|Total m|OpenCL m|Maximum m)emory usage|^Symmetries: "
+    fi
+    if [ -n "$RD_TRICKY" ]; then
+      CUT="^here we go|^Total number of single particle|^Total wall time:"
+    elif [ -z "$cmdline" ]; then # to ignore convergence behavior for default run
+      CUT="^here we go"
+    else
+      CUT="^Total wall time: "
+    fi
+    asmin rtol 4
+    numigndiff $1 $2 "$IGNORE" "$CUT"
+  elif [[ "$base" == CrossSec* ]]; then
+    if [ -n "$SURF_STAN" ]; then
+      append IGNORE "^Surface"
+    fi
+    numigndiff $1 $2 "$IGNORE"
+  elif [[ "$base" == mueller* || "$base" == ampl* ]]; then
+    if [ -n "$RD_TRICKY" ]; then
+      asmin atol 1
+      asmin rtol 1
+    else
+      asmin atol 8
+      asmin rtol 5
+    fi
+    numdiff $1 $2
+  elif [[ "$base" == log_int_* || "$base" == "log_orient_avg" ]]; then
+    if [ -n "$RD_TRICKY" ]; then
+      return 0
+    fi
+    asmin atol 10
+    numdiff $1 $2
+  elif [[ "$base" == "granules" ]]; then # compare only some comments and total number of lines
+    if [ `wc -l < $1` == `wc -l < $2` ]; then
+      append IGNORE "^([^#]|#generated by ADDA v\.)"
+      igndiff $1 $2 "$IGNORE"
+    else
+      echo "Different number of granules" >&2
+      return 1
+    fi
+  elif [[ "$base" == *.geom || "$base" == *.dat ]]; then
+    append IGNORE "generated by ADDA v\."
+    igndiff $1 $2 "$IGNORE"
+  elif [[ "$base" == IncBeam* || "$base" == RadForce* ]]; then
+    numdiff $1 $2
+  elif [[ "$base" == DipPol* || "$base" == IntField* ]]; then
+    asmin atol 12
+    asmin rtol 6
+    numdiff $1 $2
+  else
+    diff $1 $2 >&2
+  fi
+}
+function mydiff {
+  cleaned=0 # a flag, whether the files were cleaned/stripped during comparison
+  # bring up diff only if files are significantly different (see mycmp above)
+  if ! mycmp $1 $2; then
+    echo -e "DIFF above is between files '$1' and '$2'" >&2
+    if [[ $cleaned -eq 1 && "$GUIDIFF" == "strip" ]]; then
+      $GUIDIFFPROG $TMPREF $TMPTEST
+    elif [ -n "$GUIDIFF" ]; then
+      $GUIDIFFPROG $1 $2
+    fi
+    return 1
+  fi
+}
+
+#---------------- Prepare input files ----------------------------------------------------------------------------------
+
+NEEDEDFILES="scat_params.dat avg_params.dat alldir_params.dat"
+NEEDEDDIRS=""
+
+for file in $NEEDEDFILES; do
+  if [ ! -f $file ]; then
+    cp $INPUTDIR/$file ./
+  fi
+done
+for dir in $NEEDEDDIRS; do
+  if [ ! -d $dir ]; then
+    mkdir $dir
+    cp $INPUTDIR/$dir/[!.]* $dir/ # skipps hidden files and folders, like .svn
+  fi
+done
+# initialize skipping of lines up to pattern $3
+if is_extra "$3"; then
+  skip=0
+else
+  skip=1
+  echo "starting from: '$3'"
+fi
+
+echo "----------------------------------------"
+#---------------- Run comparison ---------------------------------------------------------------------------------------
+
+# This in combination with stdin redirection to ADDA calls below redirects current stdin directly
+# to ADDA call. While the stdin of the code block (while...done) is kept intact. This is especially
+# relevant to mpi version, since then ADDA is executed with mpiexec, which creates forks and a big
+# mess with stdin.
+exec 3<&0
+imax=-1
+status=0
+br="($|[^a-zA-Z0-9_])"  # right word boundary
+
+while read -r cmpfiles cmdline; do
+  if [[ "$cmpfiles" == \;*\; ]]; then
+    # process definitions of variables; each variable must be defined only once
+    let imax=imax+1
+    finds[$imax]=$cmpfiles
+    reps[$imax]="$cmdline"
+  # skip blank and commented lines, and all lines when skip=0
+  elif [[ -n "$cmpfiles" && "${cmpfiles:0:1}" != "#" && ( $skip -eq 0 || ( $skip -eq 1 && "$cmdline" == $3* ) ) ]]; then
+    skip=0;
+    # some command lines are ignored for older executables
+    if [[ -n "$OLDUSED" && -n "$CMDIGNORE" && "$cmdline" =~ $CMDIGNORE ]]; then
+      continue
+    fi
+    # test exlusion flags (!), given in the file. First test modes, then active flags
+    if [ "${cmpfiles:0:1}" == "!" ]; then
+      if [[ "$cmpfiles" =~ !$MODE$br ]]; then
+        continue
+      fi
+      for word in $ACTIVE_FLAGS; do
+        if [[ "$cmpfiles" =~ !$word$br ]]; then
+          continue 2
+        fi
+      done
+      cmpfiles="$ALLNAME"
+    fi
+    # test for specification flags (&), given in the file. First test modes, then active flags
+    if [ "${cmpfiles:0:1}" == "&" ]; then
+      if [[ "$cmpfiles" =~ \&$MODE$br ]]; then
+        cmpfiles="$ALLNAME"
+      else
+        for word in $ACTIVE_FLAGS; do
+          if [[ "$cmpfiles" =~ \&$word$br ]]; then
+            cmpfiles="$ALLNAME"
+            break
+          fi
+        done
+      fi
+      if [ "$cmpfiles" != "$ALLNAME" ]; then
+        continue
+      fi
+    fi
+    # variable substitution
+    for i in `seq 0 $imax`; do
+      cmdline="${cmdline/${finds[$i]}/${reps[$i]}}"
+    done
+    # add '-size 5' for RD_TRICKY
+    if [[ -n "$RD_TRICKY" && "$cmdline" != *"-size "* && "$cmdline" != *"-eq_rad "* && "$cmdline" != "-h "* ]]; then
+      cmdline="${cmdline} -size 5"
+    fi
+    echo -e "${cmdline}"
+    # clean up to remove warnings
+    rm -f -r $SOREF $SOTEST $DIRREF $DIRTEST
+    # reference run
+    if [ -n "$OLDUSED" ]; then
+      # The following is specific for reference version 1.4.0
+      cmdlineREF="${cmdline/-beam_center}"
+    else
+      cmdlineREF="$cmdline"
+    fi
+    runref="$EXECREF $cmdlineREF -dir $DIRREF"   
+    if !($runref <&3 > $SOREF); then
+      if [ -n "$OLDUSED" ]; then  # ignore ADDA errors in older versions
+        refok=0
+      else
+        echo -e "\nERROR while running \n$runref\nsee $SOREF" >&2
+        exit 1
+      fi
+    else
+      refok=1
+    fi
+    # test run
+    runtest="$EXECTEST $cmdline -dir $DIRTEST"
+    if !($runtest <&3 > $SOTEST); then
+      echo -e "\nERROR while running \n$runtest\nsee $SOTEST" >&2
+      exit 1
+    fi
+    # compare produced results
+    if [ $refok -eq 1 ]; then
+      if [ -d $DIRREF ]; then  #assumed that directories either both exist or both not
+        mv $SOREF $DIRREF/$SONAME
+        mv $SOTEST $DIRTEST/$SONAME
+        if [ "$cmpfiles" == $ALLNAME ]; then
+          cmpfiles=`ls $DIRREF`
+        else
+          cmpfiles="${cmpfiles//,/ }"
+        fi
+        for file in $cmpfiles; do
+          if [[ "$file" == VisFrp* ]]; then # special case for changed name of output file
+            file2="${file%.dat}"
+            file2="${file2/VisFrp/RadForce}"
+          else
+            file2="$file"
+          fi
+          if [ ! -f "$DIRREF/$file" ] && [ ! -f "$DIRTEST/$file2" ]; then
+            echo "ERROR: cannot find '$file' in output" >&2
+            exit 1
+          fi
+          if ! mydiff "$DIRREF/$file" "$DIRTEST/$file2"; then
+            status=1
+          fi
+        done
+      else
+        if [[ "$cmpfiles" == $SONAME || "$cmpfiles" == $ALLNAME ]]; then
+          mydiff $SOREF $SOTEST
+          status=$?
+        else
+          echo "When run directory is not created by ADDA, only $SONAME (or $ALLNAME) can be compared"
+          exit 1
+        fi
+      fi
+      if [ "$status" -ne 0 ]; then
+        echo -e "FAILED during '${cmdline}'" >&2
+        echo "----------------------------------------" >&2
+        status=0
+      fi
+    fi
+    # uncomment the following to exit after the first test
+    # exit 0
+  fi
+done < "$SUITEFILE"

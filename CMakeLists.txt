@@ -1,0 +1,243 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(ADDA LANGUAGES C)
+
+# This target is the sequential equivalent of src/seq/Makefile.  The original
+# CPU executable is always built; ADDA_CUDA adds a second executable with the
+# CUDA MatVec backend and does not alter the CPU target.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release or Debug)" FORCE)
+endif()
+option(ADDA_NO_FORTRAN "Disable optional Fortran routines" OFF)
+option(ADDA_SPARSE "Build sparse (non-FFT) mode" OFF)
+option(ADDA_PRECISE_TIMING "Enable precise timing" OFF)
+option(ADDA_NOT_USE_LOCK "Disable file/system locking" OFF)
+option(ADDA_ONLY_LOCKFILE "Use lock files only" OFF)
+option(ADDA_OVERRIDE_STDC_TEST "Override the C99 conformance check" OFF)
+option(ADDA_NO_GITHASH "Do not include the current Git revision" OFF)
+option(ADDA_CUDA "Build adda_cuda with MinGW against a CUDA backend prebuilt separately by nvcc" ON)
+# IMPORTANT: CMake never compiles .cu files.  The CUDA backend must be built
+# separately with nvcc (scripts/build_cuda_backend.ps1), while this project
+# remains a pure C/MinGW project.  This is intentional on Windows because nvcc
+# and MinGW must not be mixed in the same CMake compiler toolchain.
+set(ADDA_CUDA_EXTERNAL_BACKEND
+    "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/libadda_cuda_backend.a"
+    CACHE FILEPATH "MinGW import library for the separately-built CUDA backend DLL")
+set(ADDA_CUDA_EXTERNAL_DLL
+    "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend.dll"
+    CACHE FILEPATH "DLL produced separately by nvcc")
+if(ADDA_CUDA_EXTERNAL_BACKEND STREQUAL "")
+    set(ADDA_CUDA_EXTERNAL_BACKEND
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/libadda_cuda_backend.a"
+        CACHE FILEPATH "MinGW import library for the separately-built CUDA backend DLL" FORCE)
+endif()
+if(ADDA_CUDA_EXTERNAL_DLL STREQUAL "")
+    set(ADDA_CUDA_EXTERNAL_DLL
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend.dll"
+        CACHE FILEPATH "DLL produced separately by nvcc" FORCE)
+endif()
+
+if(ADDA_CUDA AND ADDA_SPARSE)
+    message(FATAL_ERROR "ADDA_CUDA requires FFT mode; ADDA_CUDA and ADDA_SPARSE cannot be enabled together.")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/fftw/fftw3.h")
+    set(_ADDA_DEFAULT_FFTW3_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/fftw")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fftw3/fftw3.h")
+    set(_ADDA_DEFAULT_FFTW3_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fftw3")
+else()
+    set(_ADDA_DEFAULT_FFTW3_ROOT "")
+endif()
+set(FFTW3_ROOT "${_ADDA_DEFAULT_FFTW3_ROOT}" CACHE PATH "Root directory of a Windows FFTW3 installation")
+set(FFTW3_INCLUDE_DIR "" CACHE PATH "Directory containing fftw3.h")
+set(FFTW3_LIBRARY "" CACHE FILEPATH "FFTW3 library or import library")
+
+set(ADDA_C_SOURCES
+    src/ADDAmain.c
+    src/CalculateE.c
+    src/calculator.c
+    src/chebyshev.c
+    src/cmplx.c
+    src/comm.c
+    src/crosssec.c
+    src/GenerateB.c
+    src/interaction.c
+    src/io.c
+    src/iterative.c
+    src/linalg.c
+    src/make_particle.c
+    src/matvec.c
+    src/memory.c
+    src/mt19937ar.c
+    src/param.c
+    src/Romberg.c
+    src/sinint.c
+    src/somnec.c
+    src/timing.c
+    src/vars.c
+    src/igt_so.c
+)
+
+if(ADDA_PRECISE_TIMING)
+    add_compile_definitions(PRECISE_TIMING)
+    list(APPEND ADDA_C_SOURCES src/prec_time.c)
+endif()
+
+if(ADDA_NO_FORTRAN)
+    add_compile_definitions(NO_FORTRAN)
+else()
+    include(CheckLanguage)
+    check_language(Fortran)
+    if(NOT CMAKE_Fortran_COMPILER)
+        message(FATAL_ERROR "ADDA_NO_FORTRAN=OFF requires gfortran (or another Fortran compiler).")
+    endif()
+    enable_language(Fortran)
+    list(APPEND ADDA_C_SOURCES
+        src/fort/d07hre.f
+        src/fort/d09hre.f
+        src/fort/d113re.f
+        src/fort/d132re.f
+        src/fort/dadhre.f
+        src/fort/dchhre.f
+        src/fort/dcuhre.f
+        src/fort/dfshre.f
+        src/fort/dinhre.f
+        src/fort/drlhre.f
+        src/fort/dtrhre.f
+        src/fort/propaesplibreintadda.f
+        src/fort/bessel.f90
+    )
+endif()
+
+if(ADDA_SPARSE)
+    add_compile_definitions(SPARSE)
+else()
+    # fft.h selects FFTW3 by default, just as src/Makefile does.  CUDA still
+    # needs FFTW3 during one-time D/R Green-tensor construction; only MatVec
+    # itself switches to cuFFT.
+    list(APPEND ADDA_C_SOURCES src/fft.c)
+    if(FFTW3_INCLUDE_DIR)
+        set(FFTW3_INCLUDE_DIR_FOUND "${FFTW3_INCLUDE_DIR}")
+    else()
+        find_path(FFTW3_INCLUDE_DIR_FOUND fftw3.h
+            HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/include")
+    endif()
+    if(FFTW3_LIBRARY)
+        set(FFTW3_LIBRARY_FOUND "${FFTW3_LIBRARY}")
+    else()
+        find_library(FFTW3_LIBRARY_FOUND NAMES fftw3 fftw3-3 libfftw3-3
+            HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/lib" "${FFTW3_ROOT}/bin")
+    endif()
+    if(NOT FFTW3_INCLUDE_DIR_FOUND OR NOT FFTW3_LIBRARY_FOUND)
+        message(FATAL_ERROR
+            "FFTW3 was not found. Set FFTW3_ROOT (or FFTW3_INCLUDE_DIR and FFTW3_LIBRARY), "
+            "or configure with -DADDA_SPARSE=ON.")
+    endif()
+    set(FFTW3_INCLUDE_DIR "${FFTW3_INCLUDE_DIR_FOUND}" CACHE PATH "Directory containing fftw3.h" FORCE)
+    set(FFTW3_LIBRARY "${FFTW3_LIBRARY_FOUND}" CACHE FILEPATH "FFTW3 library or import library" FORCE)
+    find_file(FFTW3_RUNTIME_DLL libfftw3-3.dll
+        HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/bin")
+endif()
+
+if(ADDA_NOT_USE_LOCK)
+    add_compile_definitions(NOT_USE_LOCK)
+elseif(ADDA_ONLY_LOCKFILE)
+    add_compile_definitions(ONLY_LOCKFILE)
+endif()
+if(ADDA_OVERRIDE_STDC_TEST)
+    add_compile_definitions(OVERRIDE_STDC_TEST)
+endif()
+
+if(ADDA_NO_GITHASH)
+    add_compile_definitions(NO_GITHASH)
+else()
+    execute_process(
+        COMMAND git log --pretty=format:%h -n 1
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE ADDA_GITHASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE ADDA_GIT_RESULT)
+    if(NOT ADDA_GIT_RESULT EQUAL 0)
+        set(ADDA_GITHASH "")
+    endif()
+    if(ADDA_GITHASH)
+        set(ADDA_GITHASH_DEFINE "#define GITHASH \"${ADDA_GITHASH}\"")
+    else()
+        set(ADDA_GITHASH_DEFINE "")
+    endif()
+    configure_file(src/githash.h.in "${CMAKE_CURRENT_BINARY_DIR}/githash.h" @ONLY)
+endif()
+
+function(configure_adda_target target)
+    target_include_directories(${target} PRIVATE src)
+    if(NOT ADDA_NO_GITHASH)
+        target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
+    if(NOT ADDA_SPARSE)
+        target_include_directories(${target} PRIVATE "${FFTW3_INCLUDE_DIR}")
+        target_link_libraries(${target} PRIVATE "${FFTW3_LIBRARY}")
+        if(FFTW3_RUNTIME_DLL)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${FFTW3_RUNTIME_DLL}"
+                    "$<TARGET_FILE_DIR:${target}>/libfftw3-3.dll")
+        endif()
+    endif()
+    if(NOT MSVC)
+        target_link_libraries(${target} PRIVATE m)
+    endif()
+
+    set_target_properties(${target} PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED YES
+        C_EXTENSIONS NO
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    target_compile_options(${target} PRIVATE
+        $<$<AND:$<COMPILE_LANGUAGE:C>,$<CONFIG:Release>>:-Ofast;-w>
+        $<$<AND:$<COMPILE_LANGUAGE:C>,$<CONFIG:Debug>>:-Og;-g;-Wall;-Wextra;-Wcast-qual;-Wpointer-arith;-Wwrite-strings;-Wstrict-prototypes;-Wformat=2;-Wshadow;-Wcast-align;-Wcomment>)
+endfunction()
+
+add_executable(adda ${ADDA_C_SOURCES})
+configure_adda_target(adda)
+
+if(ADDA_CUDA)
+    # CUDA is deliberately NOT enabled as a CMake language here.  CLion/CMake
+    # continues to use only the configured C compiler (MinGW/GCC).  The .cu
+    # backend is a separately-built DLL and is linked through a GNU import lib.
+    if(WIN32)
+        add_library(adda_cuda_backend SHARED IMPORTED GLOBAL)
+        set_target_properties(adda_cuda_backend PROPERTIES
+            IMPORTED_IMPLIB "${ADDA_CUDA_EXTERNAL_BACKEND}"
+            IMPORTED_LOCATION "${ADDA_CUDA_EXTERNAL_DLL}")
+    else()
+        # Kept external on non-Windows as well: CMake still never invokes nvcc.
+        add_library(adda_cuda_backend UNKNOWN IMPORTED GLOBAL)
+        set_target_properties(adda_cuda_backend PROPERTIES
+            IMPORTED_LOCATION "${ADDA_CUDA_EXTERNAL_BACKEND}")
+    endif()
+
+    set(ADDA_CUDA_SOURCES ${ADDA_C_SOURCES})
+    list(REMOVE_ITEM ADDA_CUDA_SOURCES src/matvec.c)
+    list(APPEND ADDA_CUDA_SOURCES src/cudamatvec.c)
+
+    add_executable(adda_cuda ${ADDA_CUDA_SOURCES})
+    target_compile_definitions(adda_cuda PRIVATE ADDA_CUDA)
+    target_link_libraries(adda_cuda PRIVATE adda_cuda_backend)
+    configure_adda_target(adda_cuda)
+
+    # The DLL is copied next to adda_cuda.exe only when the CUDA executable is
+    # actually linked.  Building the normal `adda` target has no dependency on
+    # nvcc, CUDA, the DLL, or its import library.
+    if(WIN32)
+        add_custom_command(TARGET adda_cuda POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ADDA_CUDA_EXTERNAL_DLL}"
+                "$<TARGET_FILE_DIR:adda_cuda>")
+    endif()
+
+    message(STATUS "ADDA_CUDA: CMake remains C/MinGW only")
+    message(STATUS "ADDA_CUDA: expected prebuilt MinGW import library: ${ADDA_CUDA_EXTERNAL_BACKEND}")
+    message(STATUS "ADDA_CUDA: expected prebuilt nvcc DLL: ${ADDA_CUDA_EXTERNAL_DLL}")
+endif()
