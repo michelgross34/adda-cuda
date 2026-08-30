@@ -312,6 +312,4 @@ This repository is an experimental CUDA extension of ADDA. CPU and CUDA results 
 
 The code in this repository was generated entirely with AI assistance from the original ADDA source distribution published by the ADDA project. At each development stage, the AI produced a ZIP archive containing the complete state of the code. This GitHub repository corresponds to the code delivered in the latest ZIP archive produced by ChatGPT.
 
-The first `CMakeLists.txt` file and the final GitHub repository setup were produced with GPT-5.6 Luna (medium/fast). The CUDA implementation and the successive code modifications were produced with GPT-5.6 Sol in Web mode, the most capable model in the current GPT-5.6 family according to the official OpenAI model guidance.
-
-The CUDA conversion was performed using an approach analogous to the work carried out for DDSCAT. The Web context was sufficient to handle the ADDA source code and its CUDA integration. This project should nevertheless be independently reviewed and validated before use in production or scientific publication.
+The first `CMakeLists.txt` file and the final GitHub repository setup were produced with GPT-5.6 Luna (medium/fast). The CUDA implementation and the successive code modifications were produced with GPT-5.6 Sol in Web mode, the most capable model in the current GPT-5.6 family according to the official OpenAI model guidance. This project should nevertheless be independently reviewed and validated before use in production or scientific publication.
