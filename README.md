@@ -294,7 +294,7 @@ doc/                       ADDA documentation
 
 ## Relationship to ADDA and DDSCAT
 
-ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). The current AI-assisted CUDA effort covers ADDA and [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda), using analogous conversion methods adapted to the respective source codes. IFDDA is mentioned here as a related DDA solver for scientific comparison; an analogous AI-assisted effort may be extended to IFDDA in the future.
+ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). CUDA ports have also been developed for DDSCAT and IFDDA. The current AI-assisted effort covers ADDA and [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda), using analogous conversion methods adapted to the respective source codes. The specific objective here is to investigate automatic CUDA porting by AI; the same approach may be extended to IFDDA in the future.
 
 For the original ADDA scientific references, capabilities, limitations, and licensing information, please consult the official ADDA repository and its documentation. This project is intended to remain compatible with the upstream ADDA command-line workflow wherever the CUDA implementation permits.
 
