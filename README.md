@@ -15,11 +15,12 @@ ADDA calculates electromagnetic scattering and absorption by particles of arbitr
 - Low-memory CUDA organization for larger problems.
 - CUDA-resident iterative solver vectors, avoiding CPU-GPU transfers during the QMR calculation.
 - CUDA implementations of the available iterative-solver vector operations.
-- MinGW/GCC C99 build support on Windows.
+- Windows build based on Makefiles, MinGW, GCC, G++, and GFortran.
+- Separate CUDA backend compilation with `nvcc`, using `scripts\\build_cuda_backend.bat`.
 
 ## Executables
 
-The following executables are produced by the Windows build. They are normally found in `cmake-build-debug/bin` or in the selected CMake build directory.
+The following executables and CUDA DLLs were present in the CLion Debug output directory `cmake-build-debug\\bin\\` on 28 August 2026.
 
 | Executable | Processor | Precision | FFT / memory organization | Purpose |
 |---|---|---|---|---|
@@ -31,6 +32,13 @@ The following executables are produced by the Windows build. They are normally f
 | `adda_single_slice.exe` | NVIDIA GPU | single / `float32` | Slice FFT | Lowest-memory slice variant |
 | `adda_low_mem.exe` | NVIDIA GPU | single / `float32` | Low-memory layout | Minimum large resident GPU buffers |
 | `adda_low_mem_double.exe` | NVIDIA GPU | double / `float64` | Low-memory layout | Low-memory layout with double precision |
+
+The CUDA backend DLLs are:
+
+| DLL | Precision | Role |
+|---|---|---|
+| `adda_cuda_backend.dll` | double / `float64` | CUDA backend for double-precision CUDA executables |
+| `adda_cuda_backend_single.dll` | single / `float32` | CUDA backend for single-precision CUDA executables |
 
 The names above describe the builds tested on Windows on 28 August 2026. The repository contains source code and build scripts; compiled binaries are not required to be committed to Git.
 
@@ -44,34 +52,51 @@ Double precision is recommended for validation, difficult or poorly conditioned 
 adda_cuda_single.exe ... -iter qmr2 -recalc_resid
 ```
 
-Available iterative solvers are `bcgs2`, `bicg`, `bicgstab`, `cgnr`, `csym`, `qmr`, and `qmr2`. The default solver is `qmr`.
+## Iterative solvers
+
+Compared with the original ADDA solver set, this version adds iterative solvers also available in [IFDDA](https://www.fresnel.fr/perso/chaumet/ifdda.html):
+
+| Solver | Command-line option | Alias |
+|---|---|---|
+| Bi-CGStab(2) | `-iter bcgs2` | `-iter bicgstab2` |
+| Bi-CG | `-iter bicg` | |
+| Bi-CGStab | `-iter bicgstab` | |
+| CGNR | `-iter cgnr` | |
+| CSYM | `-iter csym` | |
+| QMR | `-iter qmr` | |
+| QMR2 | `-iter qmr2` | |
+| BiCGStab(4) | `-iter bicgstab4` | |
+| GPBiCGStab(2) | `-iter gpbicgstab2` | `-iter gpbicgstabl2` |
+| GPBiCGStab(4) | `-iter gpbicgstab4` | `-iter gpbicgstabl4` |
+
+The default solver remains `qmr`. For single-precision calculations, `qmr2` is a useful first choice when round-off limits convergence.
 
 ## Requirements on Windows
 
 - 64-bit Windows.
-- MinGW-w64 with GCC and, for the CPU/Fortran parts where required, GFortran.
+- MinGW-w64 with GCC, G++, and GFortran.
 - NVIDIA GPU and a compatible NVIDIA driver.
 - NVIDIA CUDA Toolkit. CUDA compilation is performed separately with `nvcc`; the CUDA backend is then linked to the MinGW-built ADDA executable.
 - FFTW development files for the CPU build, when required by the selected configuration.
-- CMake and Ninja, or the provided PowerShell/batch build scripts.
+- The Windows Makefiles in `src/` and `src/seq/`.
 
-The scripts in `scripts/` document the expected MinGW and CUDA build workflow. The CUDA backend is kept separate from the C/GFortran compilation because `nvcc` and the MinGW C toolchain must not compile the same source unit.
+The ADDA C/C++/Fortran parts are compiled by the Windows Makefiles with MinGW, GCC, G++, and GFortran. The CUDA source is compiled separately with `nvcc`; it is not compiled as part of the MinGW ADDA build.
 
 ## Building
 
-From a MinGW-enabled PowerShell terminal, configure and build the standard CMake project, for example:
+From a Windows command prompt, compile the CUDA backend first:
 
-```powershell
-cmake -S . -B build-cuda -G Ninja `
-  -DCMAKE_C_COMPILER="F:/mingw64_11.2/bin/gcc.exe" `
-  -DADDA_CUDA=ON `
-  -DADDA_NO_FORTRAN=ON `
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build build-cuda
+```bat
+scripts\\build_cuda_backend.bat
 ```
 
-The CUDA backend can also be built separately using the scripts in `scripts/` and the makefile in `cuda-backend/`. Consult the accompanying build documentation before selecting a CUDA architecture or CUDA Toolkit version.
+The script invokes `nvcc` to create the CUDA DLL and MinGW `dlltool` to create its GNU import library. It does not compile ADDA itself. ADDA is then compiled separately with the Windows Makefile and linked against the CUDA backend import library. The script accepts an optional CUDA architecture and MinGW bin directory:
+
+```bat
+scripts\\build_cuda_backend.bat 86 "F:\\mingw64_11.2\\bin"
+```
+
+The Makefile is the authoritative Windows build entry point for the ADDA sources. CMake/CLion may be used to organize the project, but `nvcc` remains a separate build step.
 
 ## Running ADDA
 
