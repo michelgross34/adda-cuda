@@ -294,7 +294,7 @@ doc/                       ADDA documentation
 
 ## Relationship to ADDA and DDSCAT
 
-ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). The CUDA implementation applies the same general GPU-acceleration effort developed for [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda), adapted to ADDA's C99 code, FFT pipeline, complex arithmetic, and iterative solvers.
+ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). The CUDA conversion was performed with an AI-assisted method analogous to the method previously applied to [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda), while adapting the implementation to ADDA's C99 code, FFT pipeline, complex arithmetic, and iterative solvers.
 
 For the original ADDA scientific references, capabilities, limitations, and licensing information, please consult the official ADDA repository and its documentation. This project is intended to remain compatible with the upstream ADDA command-line workflow wherever the CUDA implementation permits.
 
