@@ -59,7 +59,16 @@ adda_cuda_single.exe ... -iter bcgs2 -reliable_resid
 adda_cuda_single.exe ... -iter gpbicgstab2 -reliable_resid
 ```
 
-The option is ignored for unsupported solvers or for non-CUDA/non-single-precision builds. It can be combined with `-recalc_resid` when a final independent residual check is required.
+The true residual is checked every 20 iterations. With `-reliable_resid`, the Krylov calculation is restarted only when the discrepancy indicates a significant residual error. With `-reliable_resid_force_restart`, a restart is forced at every 20-iteration check, even when the recursively estimated residual is still considered reliable; this option implies `-reliable_resid`.
+
+Examples:
+
+```text
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid_force_restart
+```
+
+These options are ignored for unsupported solvers or for non-CUDA/non-single-precision builds. They can be combined with `-recalc_resid` when a final independent residual check is required.
 
 ## Iterative solvers
 
