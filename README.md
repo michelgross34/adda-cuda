@@ -52,6 +52,15 @@ Double precision is recommended for validation, difficult or poorly conditioned 
 adda_cuda_single.exe ... -iter qmr2 -recalc_resid
 ```
 
+For CUDA single-precision calculations, the `-reliable_resid` option periodically evaluates the true residual instead of relying only on the recursively estimated residual. It is intended to limit residual drift and improve convergence reliability. In the current implementation it applies to CUDA `float32` BiCGStab(2)/BCGS2 and GPBiCGStab(2):
+
+```text
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid
+adda_cuda_single.exe ... -iter gpbicgstab2 -reliable_resid
+```
+
+The option is ignored for unsupported solvers or for non-CUDA/non-single-precision builds. It can be combined with `-recalc_resid` when a final independent residual check is required.
+
 ## Iterative solvers
 
 Compared with the original ADDA solver set, this version adds iterative solvers also available in [IFDDA](https://www.fresnel.fr/perso/chaumet/ifdda.html):
