@@ -25,13 +25,21 @@ void MatVec_GPU(doublecomplex * restrict argvec,
  * enum iter value, accepted as int here to keep this header independent of
  * const.h include ordering. */
 void CudaIterInit(int method);
+void CudaIterInitList(const void * const *host_ids,size_t count,const char *method_name);
+void CudaIterPrintMemoryBeforeLoop(void);
 void CudaIterSyncToHost(void);
+void CudaIterUploadOne(const doublecomplex *host_id);
+void CudaIterDownloadOne(doublecomplex *host_id);
+void CudaIterRelease(void);
 
 /* cuBLAS reductions. Names intentionally mirror linalg.c. */
 double CudaIterNorm2(const doublecomplex * restrict a,TIME_TYPE *comm_timing);
 doublecomplex CudaIterDotProd(const doublecomplex * restrict a,
                               const doublecomplex * restrict b,
                               TIME_TYPE *comm_timing);
+double complex CudaIterDotProd64(const doublecomplex * restrict a,
+                                const doublecomplex * restrict b,
+                                TIME_TYPE *comm_timing);
 doublecomplex CudaIterDotProd_conj(const doublecomplex * restrict a,
                                    const doublecomplex * restrict b,
                                    TIME_TYPE *comm_timing);

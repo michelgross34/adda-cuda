@@ -16,7 +16,8 @@ ADDA calculates electromagnetic scattering and absorption by particles of arbitr
 - CUDA-resident iterative solver vectors, avoiding CPU-GPU transfers during the QMR calculation.
 - CUDA implementations of the available iterative-solver vector operations.
 - Windows build based on Makefiles, MinGW, GCC, G++, and GFortran.
-- Separate CUDA backend compilation with `nvcc`, using `scripts\\build_cuda_backend.bat`.
+- Native Linux build with GCC, FFTW, CMake, and NVIDIA CUDA.
+- Separate CUDA backend compilation with `nvcc`, using the Windows `.bat` or Linux `.sh` script.
 
 ## Executables
 
@@ -40,6 +41,11 @@ The CUDA backend DLLs are:
 | `adda_cuda_backend.dll` | double / `float64` | CUDA backend for double-precision CUDA executables |
 | `adda_cuda_backend_single.dll` | single / `float32` | CUDA backend for single-precision CUDA executables |
 
+On Linux, the equivalent native libraries are
+`cuda-backend/libadda_cuda_backend.so` and
+`cuda-backend/libadda_cuda_backend_single.so`. The Linux executables have the
+same names as in the table above, without the `.exe` suffix.
+
 ## CMake entry points
 
 The root `CMakeLists.txt` contains the shared source lists and build rules. The
@@ -49,7 +55,7 @@ configuration, so the source list is not duplicated:
 ```text
 CMakeLists.txt        Shared CMake configuration
 windows/CMakeLists.txt Windows / MinGW / CUDA entry point
-linux/CMakeLists.txt   Linux / CPU entry point
+linux/CMakeLists.txt   Linux / CPU and CUDA entry point
 ```
 
 Use the platform-specific entry point when configuring from a clean checkout.
@@ -64,24 +70,94 @@ cmake -S windows -B build-windows -G Ninja
 cmake --build build-windows --target adda_cuda_single -j 14
 ```
 
-Linux uses the CPU targets and does not try to link the Windows CUDA DLL/import
-libraries. FFTW libraries must be installed on the Linux system or supplied
-through `FFTW3_ROOT`, `FFTW3_LIBRARY`, and `FFTW3F_LIBRARY`:
-
-```bash
-cmake -S linux -B build-linux -G Ninja
-cmake --build build-linux -j
-```
+The complete Linux procedure, including CUDA backend compilation, is described
+below.
 
 The root `CMakeLists.txt` remains the shared implementation used by both entry points.
 
+## Requirements on Linux
+
+- A C compiler supported by the project (GCC is the tested configuration).
+- CMake 3.20 or newer and either Make or Ninja.
+- FFTW development libraries for both precisions. On Debian/Ubuntu, install
+  `libfftw3-dev`.
+- For the CUDA targets: an NVIDIA CUDA Toolkit providing `nvcc`, cuFFT, and
+  cuBLAS. A compatible NVIDIA GPU and driver are required to run the CUDA
+  executables.
+
+For example, on Debian/Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake libfftw3-dev
+```
+
+Install the NVIDIA CUDA Toolkit separately if `nvcc --version` is not
+available. The distribution package name and supported CUDA version depend on
+the Linux and NVIDIA driver versions.
+
+## Building all targets on Linux
+
+Run the following commands from the repository root. Compile the two native
+CUDA backend libraries first; the optional argument is the GPU compute
+capability without the decimal point (`70` for `sm_70`, `86` for `sm_86`, and
+so on). If it is omitted, the script uses `native`:
+
+```bash
+chmod +x scripts/build_cuda_backend.sh
+./scripts/build_cuda_backend.sh 70
+```
+
+The script creates:
+
+```text
+cuda-backend/libadda_cuda_backend.so
+cuda-backend/libadda_cuda_backend_single.so
+```
+
+Then configure a Debug build through the Linux CMake entry point and build the
+`all` target:
+
+```bash
+cmake -S linux -B build-linux-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-linux-debug --target all --parallel
+```
+
+This builds all eight programs in `build-linux-debug/bin/`:
+
+```text
+adda
+adda_single
+adda_cuda
+adda_cuda_single
+adda_cuda_slice
+adda_single_slice
+adda_low_mem
+adda_low_mem_double
+```
+
+To use CLion, open the `linux/` directory as the CMake project (or configure
+the CMake source directory as `linux`), select the Debug profile, reload CMake,
+then use **Build > Build All**. The CUDA backend `.so` files must have been
+created with `scripts/build_cuda_backend.sh` before building the CUDA targets.
+If CLion previously configured the root or Windows CMake entry point, use a new
+build directory or reset its CMake cache.
+
+A short CPU single-precision smoke test is:
+
+```bash
+./build-linux-debug/bin/adda_single -grid 8 8 8 -maxiter 20
+```
+
+The Linux configuration deliberately uses the system FFTW libraries rather
+than the Windows libraries stored in `fftw/`. Custom native FFTW paths can be
+provided with `FFTW3_ROOT`, `FFTW3_LIBRARY`, and `FFTW3F_LIBRARY`.
+
 ## The `fftw/` directory
 
-The repository does not contain the Windows FFTW3 distribution. Before the
-standard Windows build, the user must provide an `fftw/` directory at the
-repository root, containing the FFTW3 header, MinGW import libraries, and
-runtime DLLs. CMake detects this directory automatically when
-`fftw/fftw3.h` is present.
+The repository root contains a Windows FFTW3 distribution in `fftw/`. CMake
+detects this directory automatically when `fftw/fftw3.h` is present, so no
+separate FFTW installation is needed for the standard Windows configuration.
 
 The files most useful for building ADDA on Windows are:
 
@@ -94,11 +170,10 @@ The files most useful for building ADDA on Windows are:
 | `libfftw3f-3.dll` | Runtime DLL for single-precision executables |
 | `libfftw3.a`, `libfftw3f.a` | Static libraries, available for alternative link configurations |
 
-The user may obtain the Windows FFTW3 distribution from the FFTW project and
-copy the required files into `fftw/`. The default ADDA targets need the C
-header, the double- and single-precision MinGW import libraries, and the
-corresponding runtime DLLs. The CMake build copies the appropriate
-`libfftw3-3.dll` or `libfftw3f-3.dll` next to each executable.
+The directory also contains FFTW Fortran interfaces, long-double/quadruple
+precision variants, threaded/ OpenMP variants, and FFTW wisdom utilities. They
+are not required by the default ADDA CMake targets. The CMake build copies the
+appropriate `libfftw3-3.dll` or `libfftw3f-3.dll` next to each executable.
 
 For a different FFTW installation, override the automatic detection, for
 example:
@@ -174,24 +249,6 @@ The default solver remains `qmr`. For single-precision calculations, `qmr2` is a
 
 The ADDA C/C++/Fortran parts are compiled by the Windows Makefiles with MinGW, GCC, G++, and GFortran. The CUDA source is compiled separately with `nvcc`; it is not compiled as part of the MinGW ADDA build.
 
-## MinGW installation path
-
-The Windows/CLion configuration used to produce the reference build used the
-following MinGW installation:
-
-```text
-F:\\mingw64_11.2\\bin
-```
-
-This is a machine-specific path, not a universal installation location. The
-`CMakeLists.txt` files do not require this exact path; however, a CLion CMake
-profile or an existing `CMakeCache.txt` may contain it. If MinGW is installed
-elsewhere, select the real installation directory in the CLion toolchain and
-make sure that the corresponding `gcc.exe`, `g++.exe`, `gfortran.exe`, and
-`dlltool.exe` are selected. The Windows Makefile can also be directed to
-another compiler by overriding its compiler variables on the `make` command
-line.
-
 ## Building
 
 From a Windows command prompt, compile the CUDA backend first:
@@ -207,18 +264,6 @@ scripts\\build_cuda_backend.bat 86 "F:\\mingw64_11.2\\bin"
 ```
 
 The Makefile is the authoritative Windows build entry point for the ADDA sources. CMake/CLion may be used to organize the project, but `nvcc` remains a separate build step.
-
-## Building with CLion
-
-After the CUDA backend has been generated, the reference Windows build was
-performed in CLion as follows:
-
-1. Select **Tools > CMake > Reset Cache and Reload Project**.
-2. Select **Build > Build All in 'Debug'**.
-
-This configures the project with the selected MinGW toolchain, builds all ADDA
-executables, and copies the required CUDA and FFTW DLLs next to the
-executables in `windows/cmake-build-debug/bin/`.
 
 ## Precompiled Windows binaries
 
@@ -286,7 +331,7 @@ The complete syntax, geometry options, material definitions, solver options, and
 src/                       ADDA C sources and CUDA integration
 src/cudamatvec_backend.cu CUDA backend and resident-vector operations
 cuda-backend/              Separate CUDA backend build files
-scripts/                   Windows MinGW/CUDA build scripts
+scripts/                   Windows and Linux CUDA build scripts
 tests/                     Regression and CUDA tests
 third_party/               Required third-party headers
 doc/                       ADDA documentation
@@ -294,11 +339,9 @@ doc/                       ADDA documentation
 
 ## Relationship to ADDA and DDSCAT
 
-ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). CUDA ports have also been developed for DDSCAT and IFDDA. The common objective of the ADDA-CUDA and [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda) efforts is automatic CUDA porting by AI while reducing GPU memory consumption, so that larger computational grids can be treated. The two projects use analogous conversion methods adapted to their respective source codes. The same approach may be extended to IFDDA in the future.
+ADDA-CUDA is based on the source code of the official [ADDA project](https://github.com/adda-team/adda). The CUDA implementation applies the same general GPU-acceleration effort developed for [DDSCAT-CUDA](https://github.com/michelgross34/ddscat-cuda), adapted to ADDA's C99 code, FFT pipeline, complex arithmetic, and iterative solvers.
 
 For the original ADDA scientific references, capabilities, limitations, and licensing information, please consult the official ADDA repository and its documentation. This project is intended to remain compatible with the upstream ADDA command-line workflow wherever the CUDA implementation permits.
-
-The relationship between ADDA, DDSCAT, and IFDDA, together with a methodology for making their numerical configurations comparable, is discussed in: C. Argentin, P. C. Chaumet, M. Gross, and M. A. Yurkin, [“Floating-point–consistent cross-verification methodology for reproducible and interoperable DDA solvers with fair benchmarking,” *Computer Physics Communications* 325 (2026), 110172](https://doi.org/10.1016/j.cpc.2026.110172). The paper provides parameter-equivalence and cross-verification guidance for these three DDA solvers and is relevant when comparing CPU/GPU implementations, precisions, solver choices, and runtimes.
 
 ## License and citation
 
@@ -309,9 +352,3 @@ If results obtained with ADDA-CUDA are published, please cite the ADDA work and 
 ## Status
 
 This repository is an experimental CUDA extension of ADDA. CPU and CUDA results should be compared on representative cases, especially when using single precision, slice FFT, or low-memory modes. Numerical agreement and convergence should be validated before using a configuration for production calculations.
-
-## AI-generated code and provenance
-
-The code in this repository was generated entirely with AI assistance from the original ADDA source distribution published by the ADDA project. At each development stage, the AI produced a ZIP archive containing the complete state of the code. This GitHub repository corresponds to the code delivered in the latest ZIP archive produced by ChatGPT.
-
-The first `CMakeLists.txt` file and the final GitHub repository setup were produced with GPT-5.6 Luna (medium/fast). The CUDA implementation and the successive code modifications were produced with GPT-5.6 Sol in Web mode, the most capable model in the current GPT-5.6 family according to the official OpenAI model guidance. This project should nevertheless be independently reviewed and validated before use in production or scientific publication.

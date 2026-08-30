@@ -28,7 +28,11 @@
 /* complex numbers; they are defined here so that headers that refer to doublecomplex can include only this small file
  * instead of large cmplx.h
  */
+#ifdef ADDA_SINGLE
+typedef float complex doublecomplex;
+#else
 typedef double complex doublecomplex;
+#endif
 
 typedef struct	      // integration parameters
 {
