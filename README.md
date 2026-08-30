@@ -176,19 +176,21 @@ The ADDA C/C++/Fortran parts are compiled by the Windows Makefiles with MinGW, G
 
 ## MinGW installation path
 
-The Windows/CLion configuration used to produce the reference build uses the
+The Windows/CLion configuration used to produce the reference build used the
 following MinGW installation:
 
 ```text
 F:\\mingw64_11.2\\bin
 ```
 
-This is a machine-specific path, not a universal installation location. If
-MinGW is installed elsewhere, replace this path in the CLion toolchain or in
-any local CMake cache and make sure that the corresponding `gcc.exe`,
-`g++.exe`, `gfortran.exe`, and `dlltool.exe` are selected. The Windows
-Makefile can also be directed to another compiler by overriding its compiler
-variables on the `make` command line.
+This is a machine-specific path, not a universal installation location. The
+`CMakeLists.txt` files do not require this exact path; however, a CLion CMake
+profile or an existing `CMakeCache.txt` may contain it. If MinGW is installed
+elsewhere, select the real installation directory in the CLion toolchain and
+make sure that the corresponding `gcc.exe`, `g++.exe`, `gfortran.exe`, and
+`dlltool.exe` are selected. The Windows Makefile can also be directed to
+another compiler by overriding its compiler variables on the `make` command
+line.
 
 ## Building
 
@@ -205,6 +207,18 @@ scripts\\build_cuda_backend.bat 86 "F:\\mingw64_11.2\\bin"
 ```
 
 The Makefile is the authoritative Windows build entry point for the ADDA sources. CMake/CLion may be used to organize the project, but `nvcc` remains a separate build step.
+
+## Building with CLion
+
+After the CUDA backend has been generated, the reference Windows build was
+performed in CLion as follows:
+
+1. Select **Tools > CMake > Reset Cache and Reload Project**.
+2. Select **Build > Build All in 'Debug'**.
+
+This configures the project with the selected MinGW toolchain, builds all ADDA
+executables, and copies the required CUDA and FFTW DLLs next to the
+executables in `windows/cmake-build-debug/bin/`.
 
 ## Precompiled Windows binaries
 
