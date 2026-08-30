@@ -174,6 +174,22 @@ The default solver remains `qmr`. For single-precision calculations, `qmr2` is a
 
 The ADDA C/C++/Fortran parts are compiled by the Windows Makefiles with MinGW, GCC, G++, and GFortran. The CUDA source is compiled separately with `nvcc`; it is not compiled as part of the MinGW ADDA build.
 
+## MinGW installation path
+
+The Windows/CLion configuration used to produce the reference build uses the
+following MinGW installation:
+
+```text
+F:\\mingw64_11.2\\bin
+```
+
+This is a machine-specific path, not a universal installation location. If
+MinGW is installed elsewhere, replace this path in the CLion toolchain or in
+any local CMake cache and make sure that the corresponding `gcc.exe`,
+`g++.exe`, `gfortran.exe`, and `dlltool.exe` are selected. The Windows
+Makefile can also be directed to another compiler by overriding its compiler
+variables on the `make` command line.
+
 ## Building
 
 From a Windows command prompt, compile the CUDA backend first:
