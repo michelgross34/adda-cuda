@@ -298,6 +298,8 @@ ADDA-CUDA is based on the source code of the official [ADDA project](https://git
 
 For the original ADDA scientific references, capabilities, limitations, and licensing information, please consult the official ADDA repository and its documentation. This project is intended to remain compatible with the upstream ADDA command-line workflow wherever the CUDA implementation permits.
 
+The relationship between ADDA, DDSCAT, and IFDDA, together with a methodology for making their numerical configurations comparable, is discussed in: C. Argentin, P. C. Chaumet, M. Gross, and M. A. Yurkin, [“Floating-point–consistent cross-verification methodology for reproducible and interoperable DDA solvers with fair benchmarking,” *Computer Physics Communications* 325 (2026), 110172](https://doi.org/10.1016/j.cpc.2026.110172). The paper provides parameter-equivalence and cross-verification guidance for these three DDA solvers and is relevant when comparing CPU/GPU implementations, precisions, solver choices, and runtimes.
+
 ## License and citation
 
 ADDA is distributed under the GNU General Public License. Please consult the license and attribution information in the upstream project before redistributing modified versions.
