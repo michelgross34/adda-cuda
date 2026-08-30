@@ -77,9 +77,11 @@ The root `CMakeLists.txt` remains the shared implementation used by both entry p
 
 ## The `fftw/` directory
 
-The repository root contains a Windows FFTW3 distribution in `fftw/`. CMake
-detects this directory automatically when `fftw/fftw3.h` is present, so no
-separate FFTW installation is needed for the standard Windows configuration.
+The repository does not contain the Windows FFTW3 distribution. Before the
+standard Windows build, the user must provide an `fftw/` directory at the
+repository root, containing the FFTW3 header, MinGW import libraries, and
+runtime DLLs. CMake detects this directory automatically when
+`fftw/fftw3.h` is present.
 
 The files most useful for building ADDA on Windows are:
 
@@ -92,10 +94,11 @@ The files most useful for building ADDA on Windows are:
 | `libfftw3f-3.dll` | Runtime DLL for single-precision executables |
 | `libfftw3.a`, `libfftw3f.a` | Static libraries, available for alternative link configurations |
 
-The directory also contains FFTW Fortran interfaces, long-double/quadruple
-precision variants, threaded/ OpenMP variants, and FFTW wisdom utilities. They
-are not required by the default ADDA CMake targets. The CMake build copies the
-appropriate `libfftw3-3.dll` or `libfftw3f-3.dll` next to each executable.
+The user may obtain the Windows FFTW3 distribution from the FFTW project and
+copy the required files into `fftw/`. The default ADDA targets need the C
+header, the double- and single-precision MinGW import libraries, and the
+corresponding runtime DLLs. The CMake build copies the appropriate
+`libfftw3-3.dll` or `libfftw3f-3.dll` next to each executable.
 
 For a different FFTW installation, override the automatic detection, for
 example:
