@@ -22,6 +22,10 @@
 extern "C" {
 #endif
 
+/* Size, in bytes, of one real value in the compiled CUDA numerical path.
+ * Used by the MinGW wrapper to reject accidental double/single DLL mismatch. */
+int adda_cuda_backend_real_bytes(void);
+
 typedef struct AddaCudaMatVecConfig {
     size_t gridX;
     size_t gridY;

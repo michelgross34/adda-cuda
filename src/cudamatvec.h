@@ -34,18 +34,18 @@ void CudaIterRelease(void);
 
 /* cuBLAS reductions. Names intentionally mirror linalg.c. */
 double CudaIterNorm2(const doublecomplex * restrict a,TIME_TYPE *comm_timing);
-doublecomplex CudaIterDotProd(const doublecomplex * restrict a,
+double complex CudaIterDotProd(const doublecomplex * restrict a,
                               const doublecomplex * restrict b,
                               TIME_TYPE *comm_timing);
 double complex CudaIterDotProd64(const doublecomplex * restrict a,
                                 const doublecomplex * restrict b,
                                 TIME_TYPE *comm_timing);
-doublecomplex CudaIterDotProd_conj(const doublecomplex * restrict a,
+double complex CudaIterDotProd_conj(const doublecomplex * restrict a,
                                    const doublecomplex * restrict b,
                                    TIME_TYPE *comm_timing);
-doublecomplex CudaIterDotProdSelf_conj(const doublecomplex * restrict a,
+double complex CudaIterDotProdSelf_conj(const doublecomplex * restrict a,
                                        TIME_TYPE *comm_timing);
-doublecomplex CudaIterDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
+double complex CudaIterDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
                                              double * restrict norm,
                                              TIME_TYPE *comm_timing);
 
@@ -58,37 +58,37 @@ void CudaIterIncrem01(doublecomplex * restrict a,const doublecomplex * restrict 
                       double * restrict inprod,TIME_TYPE *comm_timing);
 void CudaIterIncrem10(doublecomplex * restrict a,const doublecomplex * restrict b,double c,
                       double * restrict inprod,TIME_TYPE *comm_timing);
-void CudaIterIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,doublecomplex c,
+void CudaIterIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,double complex c,
                             double * restrict inprod,TIME_TYPE *comm_timing);
-void CudaIterIncrem10_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,doublecomplex c,
+void CudaIterIncrem10_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,double complex c,
                             double * restrict inprod,TIME_TYPE *comm_timing);
 void CudaIterIncrem011_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2);
+                             const doublecomplex * restrict c,double complex c1,double complex c2);
 void CudaIterIncrem110_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2);
+                             const doublecomplex * restrict c,double complex c1,double complex c2);
 void CudaIterIncrem111_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2,doublecomplex c3);
-void CudaIterIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restrict b,double c1,doublecomplex c2,
+                             const doublecomplex * restrict c,double complex c1,double complex c2,double complex c3);
+void CudaIterIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restrict b,double c1,double complex c2,
                           double * restrict inprod,TIME_TYPE *comm_timing);
 void CudaIterIncrem110_d_c_conj(doublecomplex * restrict a,const doublecomplex * restrict b,
-                                const doublecomplex * restrict c,double c1,doublecomplex c2,
+                                const doublecomplex * restrict c,double c1,double complex c2,
                                 double * restrict inprod,TIME_TYPE *comm_timing);
 
 void CudaIterLinComb_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                           const doublecomplex * restrict c,doublecomplex c1,doublecomplex c2,
+                           const doublecomplex * restrict c,double complex c1,double complex c2,
                            double * restrict inprod,TIME_TYPE *comm_timing);
 void CudaIterLinComb1_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                            const doublecomplex * restrict c,doublecomplex c1,
+                            const doublecomplex * restrict c,double complex c1,
                             double * restrict inprod,TIME_TYPE *comm_timing);
 void CudaIterLinComb1_cmplx_conj(doublecomplex * restrict a,const doublecomplex * restrict b,
-                                 const doublecomplex * restrict c,doublecomplex c1,
+                                 const doublecomplex * restrict c,double complex c1,
                                  double * restrict inprod,TIME_TYPE *comm_timing);
 
 void CudaIterMult(doublecomplex * restrict a,const doublecomplex * restrict b,double c);
-void CudaIterMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,doublecomplex c);
+void CudaIterMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,double complex c);
 void CudaIterMultSelf(doublecomplex * restrict a,double c);
 void CudaIterMultSelf_conj(doublecomplex * restrict a,double c);
-void CudaIterMultSelf_cmplx(doublecomplex * restrict a,doublecomplex c);
+void CudaIterMultSelf_cmplx(doublecomplex * restrict a,double complex c);
 
 #endif /* ADDA_CUDA */
 

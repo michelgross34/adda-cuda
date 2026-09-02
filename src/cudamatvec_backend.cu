@@ -1256,6 +1256,11 @@ static int matvecInitCommon(const AddaCudaMatVecConfig *cfg,
     return 0;
 }
 
+extern "C" int adda_cuda_backend_real_bytes(void)
+{
+    return static_cast<int>(sizeof(AddaCudaReal));
+}
+
 extern "C" int adda_cuda_matvec_init(const AddaCudaMatVecConfig *cfg,
                                       const void *Dmatrix,
                                       const void *Rmatrix,

@@ -70,7 +70,7 @@ doublecomplex * restrict expsX,* restrict expsY,* restrict expsZ; // arrays of e
 doublecomplex *rvec;                 // current residual
 doublecomplex * restrict Avecbuffer; // used to hold the result of matrix-vector products
 // auxiliary vectors, used in some iterative solvers (with more meaningful names)
-doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict vec4;
+doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict vec4,* restrict vec5,* restrict vec6,* restrict vec7;
 // used in matvec.c
 #ifdef SPARSE
 doublecomplex * restrict arg_full; // vector to hold argvec for all voxels
@@ -728,6 +728,27 @@ static void AllocateEverything(void)
 			}
 			memory+=4*tmp;
 			break;
+		case IT_BICGSTAB4:
+			/* Dynamic L=4 host identities: r~ plus r1..r4 and u1..u4.
+			 * CUDA mirrors these vectors on-device only while the solver is active. */
+			memory+=9*tmp;
+			break;
+		case IT_GPBICGSTAB4:
+			/* Memory-reduced GPBiCGStab(4): r~0,z,y,u,s0..s2,q0..q3. */
+			memory+=11*tmp;
+			break;
+		case IT_GPBICGSTAB2:
+			if (!prognosis) {
+				MALLOC_VECTOR(vec1,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec2,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec3,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec4,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec5,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec6,complex,local_nRows,ALL);
+				MALLOC_VECTOR(vec7,complex,local_nRows,ALL);
+			}
+			memory+=7*tmp;
+			break;
 		case IT_CGNR:
 		case IT_BICG_CS:
 			break;
@@ -905,6 +926,19 @@ void FreeEverything(void)
 			Free_cVector(vec2);
 			Free_cVector(vec3);
 			Free_cVector(vec4);
+			break;
+		case IT_BICGSTAB4:
+		case IT_GPBICGSTAB4:
+			/* Dynamic L=4 host workspace is released by IterativeSolver(). */
+			break;
+		case IT_GPBICGSTAB2:
+			Free_cVector(vec1);
+			Free_cVector(vec2);
+			Free_cVector(vec3);
+			Free_cVector(vec4);
+			Free_cVector(vec5);
+			Free_cVector(vec6);
+			Free_cVector(vec7);
 			break;
 		case IT_CGNR:
 		case IT_BICG_CS:

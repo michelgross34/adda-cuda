@@ -26,6 +26,10 @@
 
 #ifdef FFTW3
 #	include <fftw3.h> // for fftw_malloc; types.h should be defined before (to match C99 complex type)
+#	ifdef ADDA_SINGLE
+#		define fftw_malloc fftwf_malloc
+#		define fftw_free fftwf_free
+#	endif
 #endif
 
 // common error check

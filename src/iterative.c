@@ -37,6 +37,27 @@
 #include <string.h>
 #include <time.h> // for time_t & time
 
+/* Precision of iterative recurrence scalars. In the CUDA float32 executable
+ * the large vectors/FFT stay single precision, but dot products are reduced in
+ * FP64 by the CUDA backend. Keep those FP64 results, and all recurrence
+ * coefficients derived from them, in double complex instead of narrowing them
+ * back to ADDA_SINGLE's float complex. CPU-single behavior is unchanged. */
+#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+typedef double complex itercomplex;
+#else
+typedef doublecomplex itercomplex;
+#endif
+#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+_Static_assert(sizeof(itercomplex)==2*sizeof(double),
+               "CUDA single recurrence scalars must remain double complex");
+#endif
+
+static inline double IterAbs2(const itercomplex a)
+{
+	const double ar=creal(a),ai=cimag(a);
+	return ar*ar+ai*ai;
+}
+
 #ifdef OCL_BLAS
 #	include "oclcore.h"
 #	include <clBLAS.h> //external library
@@ -626,9 +647,9 @@ ITER_FUNC(BCGS2)
 #define EPS1 1E-10 // for 1/|beta|
 #define EPS2 1E-10 // for |u_j+1.r~|/|r_j.r~|
 	static doublecomplex * restrict r[LL+1],* restrict u[LL+1];
-	static doublecomplex matrix_z[LL+1][LL+1],y0[LL+1],yl[LL+1],zy0[LL+1],zyl[LL+1];
+	static itercomplex matrix_z[LL+1][LL+1],y0[LL+1],yl[LL+1],zy0[LL+1],zyl[LL+1];
 	static int i,j;
-	static doublecomplex alpha,beta,omega,rho0,rho1,sigma,varrho,hatgamma,temp1;
+	static itercomplex alpha,beta,omega,rho0,rho1,sigma,varrho,hatgamma,temp1;
 	static double kappa0,kappal,dtmp;
 	static bool fresh_start;
 
@@ -649,7 +670,7 @@ ITER_FUNC(BCGS2)
 			scalars[0].ptr=&rho0;
 			scalars[1].ptr=&alpha;
 			scalars[2].ptr=&fresh_start;
-			scalars[0].size=scalars[1].size=sizeof(doublecomplex);
+			scalars[0].size=scalars[1].size=sizeof(itercomplex);
 			scalars[2].size=sizeof(bool);
 			vectors[0].ptr=vec2; // u[0]
 			vectors[0].size=sizeof(doublecomplex);
@@ -1296,8 +1317,8 @@ ITER_FUNC(BiCG_CS)
 {
 #define EPS1 1E-10 // for (rT.r)/(r.r)
 #define EPS2 1E-10 // for (pT.A.p)/(rT.r)
-	static doublecomplex alpha, mu;
-	static doublecomplex beta,ro_new,ro_old,temp;
+	static itercomplex alpha, mu;
+	static itercomplex beta,ro_new,ro_old,temp;
 	static double dtmp,abs_ro_new;
 #ifdef OCL_BLAS
 	cl_mem bufro_new;
@@ -1310,7 +1331,7 @@ ITER_FUNC(BiCG_CS)
 	switch (ph) {
 		case PHASE_VARS:
 			scalars[0].ptr=&ro_old;
-			scalars[0].size=sizeof(doublecomplex);
+			scalars[0].size=sizeof(itercomplex);
 			return;
 		case PHASE_INIT: {
 #ifdef OCL_BLAS
@@ -1452,7 +1473,7 @@ ITER_FUNC(BiCGStab)
 #define EPS1 1E-10 // for 1/|beta|
 #define EPS2 1E-10 // for |v.r~|/|r.r~|
 	static double denumOmega,dtmp;
-	static doublecomplex beta,ro_new,ro_old,omega,alpha,temp1,temp2;
+	static itercomplex beta,ro_new,ro_old,omega,alpha,temp1,temp2;
 	static doublecomplex * restrict v,* restrict s,* restrict rtilda;
 
 	switch (ph) {
@@ -1467,7 +1488,7 @@ ITER_FUNC(BiCGStab)
 			scalars[0].ptr=&ro_old;
 			scalars[1].ptr=&omega;
 			scalars[2].ptr=&alpha;
-			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(doublecomplex);
+			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(itercomplex);
 			vectors[0].ptr=vec1; // v
 			vectors[1].ptr=vec2; // s
 			vectors[2].ptr=vec3; // rtilda
@@ -1587,7 +1608,7 @@ ITER_FUNC(CSYM)
  * always decrease and always be smaller than that of CGNR (for the same number of matrix-vector products).
  */
 {
-	static doublecomplex alpha,gamma,invksi,theta,eta,tau,temp1,temp2,s_old,s_new;
+	static itercomplex alpha,gamma,invksi,theta,eta,tau,temp1,temp2,s_old,s_new;
 	static double dtmp,beta,c_old,c_new;
 	static doublecomplex *q_new,*q_old,*p_new,*p_old; // can't be declared restrict due to SwapPointers
 
@@ -1606,7 +1627,7 @@ ITER_FUNC(CSYM)
 			scalars[4].ptr=&s_old;
 			scalars[5].ptr=&s_new;
 			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(double);
-			scalars[3].size=scalars[4].size=scalars[5].size=sizeof(doublecomplex);
+			scalars[3].size=scalars[4].size=scalars[5].size=sizeof(itercomplex);
 			vectors[0].ptr=vec1; // now it is q_old, but can be changed further by swapping
 			vectors[1].ptr=vec2; // now it is p_old, but can be changed further by swapping
 			vectors[0].size=vectors[1].size=sizeof(doublecomplex);
@@ -1695,7 +1716,7 @@ ITER_FUNC(CSYM)
 			SwapPointers(&q_old,&q_new);
 			// tau_k+1 = -s_k*tau_k; ||r_k|| = |tau_k+1|
 			tau*=-s_new;
-			inprodRp1=cAbs2(tau);
+			inprodRp1=IterAbs2(tau);
 #ifdef WORKAROUND146
 			dumb=tau;
 #endif
@@ -1716,8 +1737,8 @@ ITER_FUNC(QMR_CS)
 #define EPS1 1E-10 // for (vT.v)/(v.v)
 #define EPS2 1E-40 // for overflow of exponent number
 	static double c_old,c_new,omega_old,omega_new,zetaabs,dtmp1,dtmp2;
-	static doublecomplex alpha,beta,theta,eta,zeta,zetatilda,tau,tautilda;
-	static doublecomplex s_new,s_old,temp1,temp2,temp4;
+	static itercomplex alpha,beta,theta,eta,zeta,zetatilda,tau,tautilda;
+	static itercomplex s_new,s_old,temp1,temp2,temp4;
 	static doublecomplex *v,*vtilda,*p_new,*p_old; // can't be declared restrict due to SwapPointers
 
 	switch (ph) {
@@ -1737,7 +1758,7 @@ ITER_FUNC(QMR_CS)
 			scalars[6].ptr=&s_old;
 			scalars[7].ptr=&s_new;
 			scalars[0].size=scalars[1].size=scalars[2].size=scalars[3].size=sizeof(double);
-			scalars[4].size=scalars[5].size=scalars[6].size=scalars[7].size=sizeof(doublecomplex);
+			scalars[4].size=scalars[5].size=scalars[6].size=scalars[7].size=sizeof(itercomplex);
 			vectors[0].ptr=vec1; // now it is v, but can be changed further by swapping
 			vectors[1].ptr=vec2; // now it is vtilda, but can be changed further by swapping
 			vectors[2].ptr=vec3; // now it is p_old, but can be changed further by swapping
@@ -1806,7 +1827,7 @@ ITER_FUNC(QMR_CS)
 			 */
 			omega_new=sqrt(dtmp1)/cabs(beta);
 			// |zeta_k|=sqrt(|zeta~_k|^2+omega_k+1^2*|beta_k+1|^2)
-			dtmp2=cAbs2(zetatilda); // dtmp2=|zeta~_k|^2
+			dtmp2=IterAbs2(zetatilda); // dtmp2=|zeta~_k|^2
 			zetaabs=sqrt(dtmp2+dtmp1);
 			dtmp1=sqrt(dtmp2); // dtmp1=|zeta~_k|
 			// if (|zeta~_k|==0) zeta_k=|zeta_k|; else zeta=|zeta_k|*zeta~_k/|zeta~_k|
@@ -1842,7 +1863,7 @@ ITER_FUNC(QMR_CS)
 			SwapPointers(&v,&vtilda); // v~ is as v_k-1 at next iteration
 			// r_k = |s_k|^2*r_k-1 + (c_k*tau~_k+1/omega_k+1)*v_k+1
 			temp1=(c_new/omega_new)*tautilda;
-			IT_INCREM11_D_C(rvec,v,cAbs2(s_new),temp1,&inprodRp1,&Timing_OneIterComm);
+			IT_INCREM11_D_C(rvec,v,IterAbs2(s_new),temp1,&inprodRp1,&Timing_OneIterComm);
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -1864,7 +1885,7 @@ ITER_FUNC(QMR_CS_2)
 #define EPS1  1E-10 // for vT.v
 #define EPS2  1E-10 // for pT.A.p
 	static double c_old,c_new,theta_old,theta_new,ro_old,ro_new,sabs2,dtmp1;
-	static doublecomplex eps,beta,delta,eta,temp1;
+	static itercomplex eps,beta,delta,eta,temp1;
 	static doublecomplex * restrict v,* restrict d;
 
 	switch (ph) {
@@ -1879,7 +1900,7 @@ ITER_FUNC(QMR_CS_2)
 			scalars[3].ptr=&eps;
 			scalars[4].ptr=&eta;
 			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(double);
-			scalars[3].size=scalars[4].size=sizeof(doublecomplex);
+			scalars[3].size=scalars[4].size=sizeof(itercomplex);
 			vectors[0].ptr=vec1; // v
 			vectors[1].ptr=vec2; // d
 			vectors[0].size=vectors[1].size=sizeof(doublecomplex);

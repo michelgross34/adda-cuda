@@ -259,8 +259,11 @@ enum iter { // iterative methods
 	IT_BCGS2,    // Enhanced Bi-Conjugate Gradient Stabilized (2)
 	IT_BICG_CS,  // Bi-Conjugate Gradient for Complex-Symmetric matrices
 	IT_BICGSTAB, // Bi-Conjugate Gradient Stabilized
+	IT_BICGSTAB4, // BiCGStab(L) with L=4 (CPU implementation)
 	IT_CGNR,     // Conjugate Gradient for Normalized equations minimizing Residual norm
 	IT_CSYM,     // Algorithm CSYM
+	IT_GPBICGSTAB2, // Generalized Product-type BiCGStab(2)
+	IT_GPBICGSTAB4, // Generalized Product-type BiCGStab(4) (CPU implementation)
 	IT_QMR_CS,   // Quasi-minimal residual for Complex-Symmetric matrices
 	IT_QMR_CS_2  // 2-term QMR (better roundoff properties)
 	/* TO ADD NEW ITERATIVE SOLVER
@@ -393,8 +396,15 @@ enum init_field { // how to calculate initial field to be used in the iterative 
 #define F_DIPPOL_TMP    "p%d.tmp"
 #define F_GEOM_TMP      "g%d.tmp"
 	// checkpoint files
+#ifdef ADDA_SINGLE
+/* Raw checkpoint vector payloads follow sizeof(doublecomplex), therefore
+ * float32 and float64 checkpoints are intentionally kept in distinct files. */
+#define F_CHP_LOG       "chp_single.log"
+#define F_CHP           "chp_single.%d"   // ringid as argument
+#else
 #define F_CHP_LOG       "chp.log"
 #define F_CHP           "chp.%d"   // ringid as argument
+#endif
 
 // default file and directory names; can be changed by command line options
 #define FD_ALLDIR_PARMS "alldir_params.dat"

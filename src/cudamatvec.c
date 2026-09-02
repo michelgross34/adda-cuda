@@ -37,10 +37,12 @@ extern size_t TotalMatVec;
 extern doublecomplex *rvec;
 extern doublecomplex * restrict vec1,* restrict vec2,* restrict vec3,* restrict vec4,* restrict vec5,* restrict vec6,* restrict vec7,* restrict Avecbuffer;
 
-/* Wall-clock timestamp of the previous MatVec return. */
+#ifdef ADDA_CUDA_INFO
+/* Extra diagnostic state.  Disabled completely when CMake INFO=OFF. */
 static SYSTEM_TIME previous_matvec_exit;
 static bool have_previous_matvec_exit = false;
 static bool have_printed_cc_memory = false;
+#endif
 
 #ifdef PRECISE_TIMING
 void FreeEverything(void);
@@ -51,11 +53,12 @@ static void CudaCheck(const int status,const char *where)
     if (status != 0) LogError(ONE_POS,"CUDA error in %s: %s",where,adda_cuda_matvec_last_error());
 }
 
-static doublecomplex MakeComplex(const double re,const double im)
+static double complex MakeComplex(const double re,const double im)
 {
     return re + I*im;
 }
 
+#ifdef ADDA_CUDA_INFO
 static void PrintCudaMemory(const char *stage)
 {
     AddaCudaMemoryInfo info;
@@ -132,11 +135,23 @@ static void PrintCudaMemory(const char *stage)
               (double)info.device_total_bytes/mib,
               (double)info.current_free_bytes/mib);
 }
+#endif /* ADDA_CUDA_INFO */
 
 void CudaMatVecInit(void)
 {
     if (prognosis) return;
+    {
+        const int expected_real_bytes=(int)(sizeof(doublecomplex)/2);
+        const int backend_real_bytes=adda_cuda_backend_real_bytes();
+        if (backend_real_bytes!=expected_real_bytes)
+            LogError(ONE_POS,
+                "CUDA backend precision mismatch: executable expects %d-byte real/complex data but loaded DLL uses %d-byte reals. "
+                "Rebuild/copy the matching CUDA backend DLL.",
+                expected_real_bytes,backend_real_bytes);
+    }
+#ifdef ADDA_CUDA_INFO
     have_printed_cc_memory=false;
+#endif
     AddaCudaMatVecConfig cfg;
     cfg.gridX=gridX;
     cfg.gridY=gridY;
@@ -161,8 +176,9 @@ void CudaMatVecInit(void)
     CudaCheck(adda_cuda_matvec_init(&cfg,Dmatrix,surface ? Rmatrix : NULL,material,position),
               "CUDA backend initialization");
 #endif
+#ifdef ADDA_CUDA_INFO
 #ifdef ADDA_SINGLE
-    PrintBoth(logfile,"CUDA numerical data path: float32 complex; dot/norm reductions use chunked cuBLAS FP64 and CPU double accumulation; scalar convergence/control values remain double.\n");
+    PrintBoth(logfile,"CUDA numerical data path: float32 complex vectors/FFT; dot/norm reductions use chunked cuBLAS FP64 with CPU double accumulation; solver recurrence coefficients remain double/double-complex.\n");
 #else
     PrintBoth(logfile,"CUDA numerical data path: float64 complex.\n");
 #endif
@@ -197,16 +213,19 @@ void CudaMatVecInit(void)
     }
 #endif
     PrintCudaMemory("after MatVec initialization");
+#endif /* ADDA_CUDA_INFO */
 }
 
 void CudaMatVecUpdateCC(void)
 {
     if (prognosis) return;
     CudaCheck(adda_cuda_matvec_update_cc(cc_sqrt,(size_t)MAX_NMAT*3),"cc_sqrt update");
+#ifdef ADDA_CUDA_INFO
     if (!have_printed_cc_memory) {
         PrintCudaMemory("after cc_sqrt allocation/update");
         have_printed_cc_memory=true;
     }
+#endif
 }
 
 void CudaMatVecFree(void)
@@ -226,7 +245,7 @@ static void MatVecCommon(doublecomplex * restrict argvec,
     TIME_TYPE tstart=GET_TIME();
     if (ipr && !ipr_required) LogError(ONE_POS,"Incompatibility error in CUDA MatVec");
 
-#ifdef PRECISE_TIMING
+#if defined(PRECISE_TIMING) && defined(ADDA_CUDA_INFO)
     SYSTEM_TIME tvp[2];
     GET_SYSTEM_TIME(tvp);
 #endif
@@ -239,6 +258,7 @@ static void MatVecCommon(doublecomplex * restrict argvec,
 
     if (ipr) MyInnerProduct(inprod,double_type,1,comm_timing);
 
+#ifdef ADDA_CUDA_INFO
     SYSTEM_TIME current_matvec_exit;
     GET_SYSTEM_TIME(&current_matvec_exit);
     if (have_previous_matvec_exit) {
@@ -264,8 +284,9 @@ static void MatVecCommon(doublecomplex * restrict argvec,
     }
     previous_matvec_exit = current_matvec_exit;
     have_previous_matvec_exit = true;
+#endif /* ADDA_CUDA_INFO */
 
-#ifdef PRECISE_TIMING
+#if defined(PRECISE_TIMING) && defined(ADDA_CUDA_INFO)
     GET_SYSTEM_TIME(tvp+1);
     if (IFROOT) {
         PrintBoth(logfile,
@@ -349,6 +370,7 @@ void CudaIterInit(const int method)
     CudaCheck(adda_cuda_iter_init(xvec,rvec,pvec,v1,v2,v3,v4,v5,v6,v7,Avecbuffer),
               "iterative resident-vector initialization");
 
+#ifdef ADDA_CUDA_INFO
     /* d_arg and d_result already exist for MatVec and are reused as xvec/rvec.
      * Therefore only resident_vectors-2 new nrows-sized CUDA vectors are allocated. */
     const size_t bytes_per_vector=local_nRows*sizeof(doublecomplex);
@@ -360,12 +382,17 @@ void CudaIterInit(const int method)
               method_name,resident_vectors,resident_vectors-2,
               (double)extra_bytes/(1024.0*1024.0),(double)total_bytes/(1024.0*1024.0));
     PrintCudaMemory("after iterative-solver allocation");
+#else
+    (void)method_name;
+    (void)resident_vectors;
+#endif /* ADDA_CUDA_INFO */
 }
 
 void CudaIterInitList(const void * const *host_ids,size_t count,const char *method_name)
 {
     if (host_ids==NULL || count<2) LogError(ONE_POS,"Invalid CUDA iterative vector list");
     CudaCheck(adda_cuda_iter_init_list(host_ids,count),"iterative resident-vector list initialization");
+#ifdef ADDA_CUDA_INFO
     const size_t bytes_per_vector=local_nRows*sizeof(doublecomplex);
     const size_t extra_count=count-2; /* x/r reuse d_arg/d_result */
     const size_t extra_bytes=extra_count*bytes_per_vector;
@@ -376,6 +403,9 @@ void CudaIterInitList(const void * const *host_ids,size_t count,const char *meth
               method_name,count,extra_count,
               (double)extra_bytes/(1024.0*1024.0),(double)total_bytes/(1024.0*1024.0));
     PrintCudaMemory("after iterative-solver allocation");
+#else
+    (void)method_name;
+#endif /* ADDA_CUDA_INFO */
 }
 
 void CudaIterPrintMemoryBeforeLoop(void)
@@ -383,7 +413,9 @@ void CudaIterPrintMemoryBeforeLoop(void)
     /* Called after PHASE_INIT and immediately before the first solver iteration.
      * At this point all resident solver buffers are allocated and initialized,
      * so this is the most representative pre-iteration GPU-memory snapshot. */
+#ifdef ADDA_CUDA_INFO
     PrintCudaMemory("immediately before iterative loop");
+#endif
 }
 
 void CudaIterSyncToHost(void)
@@ -404,7 +436,9 @@ void CudaIterDownloadOne(doublecomplex *host_id)
 void CudaIterRelease(void)
 {
     CudaCheck(adda_cuda_iter_release(),"iterative resident-vector release");
+#ifdef ADDA_CUDA_INFO
     PrintCudaMemory("after iterative-solver release");
+#endif
 }
 
 static void IgnoreComm(TIME_TYPE *comm_timing)
@@ -420,7 +454,7 @@ double CudaIterNorm2(const doublecomplex * restrict a,TIME_TYPE *comm_timing)
     return res;
 }
 
-doublecomplex CudaIterDotProd(const doublecomplex * restrict a,
+double complex CudaIterDotProd(const doublecomplex * restrict a,
                               const doublecomplex * restrict b,
                               TIME_TYPE *comm_timing)
 {
@@ -440,7 +474,7 @@ double complex CudaIterDotProd64(const doublecomplex * restrict a,
     return re + I*im;
 }
 
-doublecomplex CudaIterDotProd_conj(const doublecomplex * restrict a,
+double complex CudaIterDotProd_conj(const doublecomplex * restrict a,
                                    const doublecomplex * restrict b,
                                    TIME_TYPE *comm_timing)
 {
@@ -450,12 +484,12 @@ doublecomplex CudaIterDotProd_conj(const doublecomplex * restrict a,
     return MakeComplex(re,im);
 }
 
-doublecomplex CudaIterDotProdSelf_conj(const doublecomplex * restrict a,TIME_TYPE *comm_timing)
+double complex CudaIterDotProdSelf_conj(const doublecomplex * restrict a,TIME_TYPE *comm_timing)
 {
     return CudaIterDotProd_conj(a,a,comm_timing);
 }
 
-doublecomplex CudaIterDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
+double complex CudaIterDotProdSelf_conj_Norm2(const doublecomplex * restrict a,
                                              double * restrict norm,
                                              TIME_TYPE *comm_timing)
 {
@@ -476,7 +510,7 @@ void CudaIterMult(doublecomplex * restrict a,const doublecomplex * restrict b,co
     CudaCheck(adda_cuda_iter_mult(a,b,c,0.0),"iterative real multiply kernel");
 }
 
-void CudaIterMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const doublecomplex c)
+void CudaIterMult_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const double complex c)
 {
     CudaCheck(adda_cuda_iter_mult(a,b,creal(c),cimag(c)),"iterative complex multiply kernel");
 }
@@ -491,7 +525,7 @@ void CudaIterMultSelf_conj(doublecomplex * restrict a,const double c)
     CudaCheck(adda_cuda_iter_mult_self_conj(a,c),"iterative conjugate self-multiply kernel");
 }
 
-void CudaIterMultSelf_cmplx(doublecomplex * restrict a,const doublecomplex c)
+void CudaIterMultSelf_cmplx(doublecomplex * restrict a,const double complex c)
 {
     CudaCheck(adda_cuda_iter_mult_self(a,creal(c),cimag(c)),"iterative complex self-multiply kernel");
 }
@@ -517,14 +551,14 @@ void CudaIterIncrem10(doublecomplex * restrict a,const doublecomplex * restrict 
     CudaCheck(adda_cuda_iter_increm10(a,b,c,0.0,inprod),"iterative Increm10 real kernel");
 }
 
-void CudaIterIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const doublecomplex c,
+void CudaIterIncrem01_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const double complex c,
                             double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
     CudaCheck(adda_cuda_iter_increm01(a,b,creal(c),cimag(c),inprod),"iterative Increm01 complex kernel");
 }
 
-void CudaIterIncrem10_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const doublecomplex c,
+void CudaIterIncrem10_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,const double complex c,
                             double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
@@ -532,29 +566,29 @@ void CudaIterIncrem10_cmplx(doublecomplex * restrict a,const doublecomplex * res
 }
 
 void CudaIterIncrem011_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2)
+                             const doublecomplex * restrict c,const double complex c1,const double complex c2)
 {
     CudaCheck(adda_cuda_iter_increm011(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2),NULL),
               "iterative Increm011 kernel");
 }
 
 void CudaIterIncrem110_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2)
+                             const doublecomplex * restrict c,const double complex c1,const double complex c2)
 {
     CudaCheck(adda_cuda_iter_increm110(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2)),
               "iterative Increm110 kernel");
 }
 
 void CudaIterIncrem111_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                             const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2,
-                             const doublecomplex c3)
+                             const doublecomplex * restrict c,const double complex c1,const double complex c2,
+                             const double complex c3)
 {
     CudaCheck(adda_cuda_iter_increm111(a,b,c,creal(c1),cimag(c1),creal(c2),cimag(c2),creal(c3),cimag(c3)),
               "iterative Increm111 kernel");
 }
 
 void CudaIterIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restrict b,const double c1,
-                          const doublecomplex c2,double * restrict inprod,TIME_TYPE *comm_timing)
+                          const double complex c2,double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
     CudaCheck(adda_cuda_iter_increm11_d_c(a,b,c1,creal(c2),cimag(c2),inprod),
@@ -562,7 +596,7 @@ void CudaIterIncrem11_d_c(doublecomplex * restrict a,const doublecomplex * restr
 }
 
 void CudaIterIncrem110_d_c_conj(doublecomplex * restrict a,const doublecomplex * restrict b,
-                                const doublecomplex * restrict c,const double c1,const doublecomplex c2,
+                                const doublecomplex * restrict c,const double c1,const double complex c2,
                                 double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
@@ -571,7 +605,7 @@ void CudaIterIncrem110_d_c_conj(doublecomplex * restrict a,const doublecomplex *
 }
 
 void CudaIterLinComb_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                           const doublecomplex * restrict c,const doublecomplex c1,const doublecomplex c2,
+                           const doublecomplex * restrict c,const double complex c1,const double complex c2,
                            double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
@@ -580,7 +614,7 @@ void CudaIterLinComb_cmplx(doublecomplex * restrict a,const doublecomplex * rest
 }
 
 void CudaIterLinComb1_cmplx(doublecomplex * restrict a,const doublecomplex * restrict b,
-                            const doublecomplex * restrict c,const doublecomplex c1,
+                            const doublecomplex * restrict c,const double complex c1,
                             double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);
@@ -588,7 +622,7 @@ void CudaIterLinComb1_cmplx(doublecomplex * restrict a,const doublecomplex * res
 }
 
 void CudaIterLinComb1_cmplx_conj(doublecomplex * restrict a,const doublecomplex * restrict b,
-                                 const doublecomplex * restrict c,const doublecomplex c1,
+                                 const doublecomplex * restrict c,const double complex c1,
                                  double * restrict inprod,TIME_TYPE *comm_timing)
 {
     IgnoreComm(comm_timing);

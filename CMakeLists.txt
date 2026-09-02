@@ -8,14 +8,21 @@ project(ADDA LANGUAGES C)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release or Debug)" FORCE)
 endif()
-option(ADDA_NO_FORTRAN "Disable optional Fortran routines" OFF)
+option(ADDA_NO_FORTRAN "Disable optional Fortran routines" ON)
 option(ADDA_SPARSE "Build sparse (non-FFT) mode" OFF)
 option(ADDA_PRECISE_TIMING "Enable precise timing" OFF)
+option(INFO "Show detailed CUDA memory reservation and MatVec timing information" OFF)
 option(ADDA_NOT_USE_LOCK "Disable file/system locking" OFF)
 option(ADDA_ONLY_LOCKFILE "Use lock files only" OFF)
 option(ADDA_OVERRIDE_STDC_TEST "Override the C99 conformance check" OFF)
 option(ADDA_NO_GITHASH "Do not include the current Git revision" OFF)
-option(ADDA_CUDA "Build adda_cuda with MinGW against a CUDA backend prebuilt separately by nvcc" ON)
+option(ADDA_CUDA "Build double-precision CUDA targets with MinGW against a prebuilt nvcc backend" ON)
+option(ADDA_CUDA_SLICE "Build double-precision adda_cuda_slice" ON)
+option(ADDA_CUDA_LOW_MEM "Build the preserved double-precision low-memory reference as adda_low_mem_double" ON)
+option(ADDA_SINGLE "Build CPU single-data-path executable adda_single" ON)
+option(ADDA_CUDA_SINGLE "Build full-grid float32 CUDA executable adda_cuda_single" ON)
+option(ADDA_CUDA_SINGLE_SLICE "Build float32 slice executable adda_single_slice" ON)
+option(ADDA_CUDA_LOW_MEM_SINGLE "Build float32 slice+first-octant executable adda_low_mem" ON)
 # IMPORTANT: CMake never compiles .cu files.  The CUDA backend must be built
 # separately with nvcc (scripts/build_cuda_backend.ps1), while this project
 # remains a pure C/MinGW project.  This is intentional on Windows because nvcc
@@ -26,6 +33,12 @@ set(ADDA_CUDA_EXTERNAL_BACKEND
 set(ADDA_CUDA_EXTERNAL_DLL
     "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend.dll"
     CACHE FILEPATH "DLL produced separately by nvcc")
+set(ADDA_CUDA_SINGLE_EXTERNAL_BACKEND
+    "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/libadda_cuda_backend_single.a"
+    CACHE FILEPATH "MinGW import library for the separately-built float32 CUDA backend DLL")
+set(ADDA_CUDA_SINGLE_EXTERNAL_DLL
+    "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend_single.dll"
+    CACHE FILEPATH "Float32 DLL produced separately by nvcc")
 if(ADDA_CUDA_EXTERNAL_BACKEND STREQUAL "")
     set(ADDA_CUDA_EXTERNAL_BACKEND
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/libadda_cuda_backend.a"
@@ -36,9 +49,19 @@ if(ADDA_CUDA_EXTERNAL_DLL STREQUAL "")
         "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend.dll"
         CACHE FILEPATH "DLL produced separately by nvcc" FORCE)
 endif()
+if(ADDA_CUDA_SINGLE_EXTERNAL_BACKEND STREQUAL "")
+    set(ADDA_CUDA_SINGLE_EXTERNAL_BACKEND
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/libadda_cuda_backend_single.a"
+        CACHE FILEPATH "MinGW import library for the separately-built float32 CUDA backend DLL" FORCE)
+endif()
+if(ADDA_CUDA_SINGLE_EXTERNAL_DLL STREQUAL "")
+    set(ADDA_CUDA_SINGLE_EXTERNAL_DLL
+        "${CMAKE_CURRENT_SOURCE_DIR}/cuda-backend/adda_cuda_backend_single.dll"
+        CACHE FILEPATH "Float32 DLL produced separately by nvcc" FORCE)
+endif()
 
-if(ADDA_CUDA AND ADDA_SPARSE)
-    message(FATAL_ERROR "ADDA_CUDA requires FFT mode; ADDA_CUDA and ADDA_SPARSE cannot be enabled together.")
+if((ADDA_CUDA OR ADDA_CUDA_SINGLE OR ADDA_CUDA_SINGLE_SLICE OR ADDA_CUDA_LOW_MEM_SINGLE) AND ADDA_SPARSE)
+    message(FATAL_ERROR "CUDA MatVec targets require FFT mode and cannot be built with ADDA_SPARSE.")
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/fftw/fftw3.h")
@@ -50,7 +73,8 @@ else()
 endif()
 set(FFTW3_ROOT "${_ADDA_DEFAULT_FFTW3_ROOT}" CACHE PATH "Root directory of a Windows FFTW3 installation")
 set(FFTW3_INCLUDE_DIR "" CACHE PATH "Directory containing fftw3.h")
-set(FFTW3_LIBRARY "" CACHE FILEPATH "FFTW3 library or import library")
+set(FFTW3_LIBRARY "" CACHE FILEPATH "FFTW3 double library or import library")
+set(FFTW3F_LIBRARY "" CACHE FILEPATH "FFTW3 float library or import library")
 
 set(ADDA_C_SOURCES
     src/ADDAmain.c
@@ -130,13 +154,29 @@ else()
     endif()
     if(NOT FFTW3_INCLUDE_DIR_FOUND OR NOT FFTW3_LIBRARY_FOUND)
         message(FATAL_ERROR
-            "FFTW3 was not found. Set FFTW3_ROOT (or FFTW3_INCLUDE_DIR and FFTW3_LIBRARY), "
+            "FFTW3 double precision was not found. Set FFTW3_ROOT (or FFTW3_INCLUDE_DIR and FFTW3_LIBRARY), "
             "or configure with -DADDA_SPARSE=ON.")
     endif()
     set(FFTW3_INCLUDE_DIR "${FFTW3_INCLUDE_DIR_FOUND}" CACHE PATH "Directory containing fftw3.h" FORCE)
-    set(FFTW3_LIBRARY "${FFTW3_LIBRARY_FOUND}" CACHE FILEPATH "FFTW3 library or import library" FORCE)
+    set(FFTW3_LIBRARY "${FFTW3_LIBRARY_FOUND}" CACHE FILEPATH "FFTW3 double library or import library" FORCE)
     find_file(FFTW3_RUNTIME_DLL libfftw3-3.dll
         HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/bin")
+
+    if(ADDA_SINGLE OR ADDA_CUDA_SINGLE OR ADDA_CUDA_SINGLE_SLICE OR ADDA_CUDA_LOW_MEM_SINGLE)
+        if(FFTW3F_LIBRARY)
+            set(FFTW3F_LIBRARY_FOUND "${FFTW3F_LIBRARY}")
+        else()
+            find_library(FFTW3F_LIBRARY_FOUND NAMES fftw3f fftw3f-3 libfftw3f-3
+                HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/lib" "${FFTW3_ROOT}/bin")
+        endif()
+        if(NOT FFTW3F_LIBRARY_FOUND)
+            message(FATAL_ERROR
+                "FFTW3 single precision was not found. Install/provide libfftw3f-3 and set FFTW3F_LIBRARY.")
+        endif()
+        set(FFTW3F_LIBRARY "${FFTW3F_LIBRARY_FOUND}" CACHE FILEPATH "FFTW3 float library or import library" FORCE)
+        find_file(FFTW3F_RUNTIME_DLL libfftw3f-3.dll
+            HINTS "${FFTW3_ROOT}" "${FFTW3_ROOT}/bin")
+    endif()
 endif()
 
 if(ADDA_NOT_USE_LOCK)
@@ -169,20 +209,33 @@ else()
     configure_file(src/githash.h.in "${CMAKE_CURRENT_BINARY_DIR}/githash.h" @ONLY)
 endif()
 
-function(configure_adda_target target)
+function(configure_adda_target target precision)
     target_include_directories(${target} PRIVATE src)
     if(NOT ADDA_NO_GITHASH)
         target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     endif()
     if(NOT ADDA_SPARSE)
         target_include_directories(${target} PRIVATE "${FFTW3_INCLUDE_DIR}")
-        target_link_libraries(${target} PRIVATE "${FFTW3_LIBRARY}")
-        if(FFTW3_RUNTIME_DLL)
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${FFTW3_RUNTIME_DLL}"
-                    "$<TARGET_FILE_DIR:${target}>/libfftw3-3.dll")
+        if(precision STREQUAL "single")
+            target_link_libraries(${target} PRIVATE "${FFTW3F_LIBRARY}")
+            target_compile_definitions(${target} PRIVATE ADDA_SINGLE)
+            if(FFTW3F_RUNTIME_DLL)
+                add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${FFTW3F_RUNTIME_DLL}"
+                        "$<TARGET_FILE_DIR:${target}>/libfftw3f-3.dll")
+            endif()
+        else()
+            target_link_libraries(${target} PRIVATE "${FFTW3_LIBRARY}")
+            if(FFTW3_RUNTIME_DLL)
+                add_custom_command(TARGET ${target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${FFTW3_RUNTIME_DLL}"
+                        "$<TARGET_FILE_DIR:${target}>/libfftw3-3.dll")
+            endif()
         endif()
+    elseif(precision STREQUAL "single")
+        target_compile_definitions(${target} PRIVATE ADDA_SINGLE)
     endif()
     if(NOT MSVC)
         target_link_libraries(${target} PRIVATE m)
@@ -200,44 +253,107 @@ function(configure_adda_target target)
 endfunction()
 
 add_executable(adda ${ADDA_C_SOURCES})
-configure_adda_target(adda)
+configure_adda_target(adda double)
 
-if(ADDA_CUDA)
-    # CUDA is deliberately NOT enabled as a CMake language here.  CLion/CMake
-    # continues to use only the configured C compiler (MinGW/GCC).  The .cu
-    # backend is a separately-built DLL and is linked through a GNU import lib.
+if(ADDA_SINGLE)
+    add_executable(adda_single ${ADDA_C_SOURCES})
+    configure_adda_target(adda_single single)
+endif()
+
+if(ADDA_CUDA OR ADDA_CUDA_SINGLE OR ADDA_CUDA_SINGLE_SLICE OR ADDA_CUDA_LOW_MEM_SINGLE)
+    # CUDA remains external to CMake: nvcc builds two ABI-compatible DLLs, one
+    # double and one float32. MinGW links against the matching import library.
     if(WIN32)
         add_library(adda_cuda_backend SHARED IMPORTED GLOBAL)
         set_target_properties(adda_cuda_backend PROPERTIES
             IMPORTED_IMPLIB "${ADDA_CUDA_EXTERNAL_BACKEND}"
             IMPORTED_LOCATION "${ADDA_CUDA_EXTERNAL_DLL}")
+        add_library(adda_cuda_backend_single SHARED IMPORTED GLOBAL)
+        set_target_properties(adda_cuda_backend_single PROPERTIES
+            IMPORTED_IMPLIB "${ADDA_CUDA_SINGLE_EXTERNAL_BACKEND}"
+            IMPORTED_LOCATION "${ADDA_CUDA_SINGLE_EXTERNAL_DLL}")
     else()
-        # Kept external on non-Windows as well: CMake still never invokes nvcc.
         add_library(adda_cuda_backend UNKNOWN IMPORTED GLOBAL)
-        set_target_properties(adda_cuda_backend PROPERTIES
-            IMPORTED_LOCATION "${ADDA_CUDA_EXTERNAL_BACKEND}")
+        set_target_properties(adda_cuda_backend PROPERTIES IMPORTED_LOCATION "${ADDA_CUDA_EXTERNAL_BACKEND}")
+        add_library(adda_cuda_backend_single UNKNOWN IMPORTED GLOBAL)
+        set_target_properties(adda_cuda_backend_single PROPERTIES IMPORTED_LOCATION "${ADDA_CUDA_SINGLE_EXTERNAL_BACKEND}")
     endif()
 
     set(ADDA_CUDA_SOURCES ${ADDA_C_SOURCES})
     list(REMOVE_ITEM ADDA_CUDA_SOURCES src/matvec.c)
     list(APPEND ADDA_CUDA_SOURCES src/cudamatvec.c)
 
-    add_executable(adda_cuda ${ADDA_CUDA_SOURCES})
-    target_compile_definitions(adda_cuda PRIVATE ADDA_CUDA)
-    target_link_libraries(adda_cuda PRIVATE adda_cuda_backend)
-    configure_adda_target(adda_cuda)
+    if(ADDA_CUDA)
+        add_executable(adda_cuda ${ADDA_CUDA_SOURCES})
+        target_compile_definitions(adda_cuda PRIVATE ADDA_CUDA)
+        target_link_libraries(adda_cuda PRIVATE adda_cuda_backend)
+        configure_adda_target(adda_cuda double)
 
-    # The DLL is copied next to adda_cuda.exe only when the CUDA executable is
-    # actually linked.  Building the normal `adda` target has no dependency on
-    # nvcc, CUDA, the DLL, or its import library.
-    if(WIN32)
-        add_custom_command(TARGET adda_cuda POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${ADDA_CUDA_EXTERNAL_DLL}"
-                "$<TARGET_FILE_DIR:adda_cuda>")
+        if(ADDA_CUDA_SLICE)
+            add_executable(adda_cuda_slice ${ADDA_CUDA_SOURCES})
+            target_compile_definitions(adda_cuda_slice PRIVATE ADDA_CUDA ADDA_CUDA_SLICE)
+            target_link_libraries(adda_cuda_slice PRIVATE adda_cuda_backend)
+            configure_adda_target(adda_cuda_slice double)
+        endif()
+
+        if(ADDA_CUDA_LOW_MEM)
+            add_executable(adda_low_mem_double ${ADDA_CUDA_SOURCES})
+            target_compile_definitions(adda_low_mem_double PRIVATE ADDA_CUDA ADDA_CUDA_SLICE ADDA_CUDA_LOW_MEM)
+            target_link_libraries(adda_low_mem_double PRIVATE adda_cuda_backend)
+            configure_adda_target(adda_low_mem_double double)
+        endif()
     endif()
 
-    message(STATUS "ADDA_CUDA: CMake remains C/MinGW only")
-    message(STATUS "ADDA_CUDA: expected prebuilt MinGW import library: ${ADDA_CUDA_EXTERNAL_BACKEND}")
-    message(STATUS "ADDA_CUDA: expected prebuilt nvcc DLL: ${ADDA_CUDA_EXTERNAL_DLL}")
+    if(ADDA_CUDA_SINGLE)
+        add_executable(adda_cuda_single ${ADDA_CUDA_SOURCES})
+        target_compile_definitions(adda_cuda_single PRIVATE ADDA_CUDA)
+        target_link_libraries(adda_cuda_single PRIVATE adda_cuda_backend_single)
+        configure_adda_target(adda_cuda_single single)
+    endif()
+
+    if(ADDA_CUDA_SINGLE_SLICE)
+        add_executable(adda_single_slice ${ADDA_CUDA_SOURCES})
+        target_compile_definitions(adda_single_slice PRIVATE ADDA_CUDA ADDA_CUDA_SLICE)
+        target_link_libraries(adda_single_slice PRIVATE adda_cuda_backend_single)
+        configure_adda_target(adda_single_slice single)
+    endif()
+
+    if(ADDA_CUDA_LOW_MEM_SINGLE)
+        add_executable(adda_low_mem ${ADDA_CUDA_SOURCES})
+        target_compile_definitions(adda_low_mem PRIVATE ADDA_CUDA ADDA_CUDA_SLICE ADDA_CUDA_LOW_MEM)
+        target_link_libraries(adda_low_mem PRIVATE adda_cuda_backend_single)
+        configure_adda_target(adda_low_mem single)
+    endif()
+
+    if(WIN32)
+        foreach(tgt IN ITEMS adda_cuda adda_cuda_slice adda_low_mem_double)
+            if(TARGET ${tgt})
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${ADDA_CUDA_EXTERNAL_DLL}" "$<TARGET_FILE_DIR:${tgt}>")
+            endif()
+        endforeach()
+        foreach(tgt IN ITEMS adda_cuda_single adda_single_slice adda_low_mem)
+            if(TARGET ${tgt})
+                add_custom_command(TARGET ${tgt} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${ADDA_CUDA_SINGLE_EXTERNAL_DLL}" "$<TARGET_FILE_DIR:${tgt}>")
+            endif()
+        endforeach()
+    endif()
+
+    # INFO is intentionally OFF by default.  It only controls the extra CUDA
+    # diagnostic output; it never changes the numerical path.
+    if(INFO)
+        foreach(tgt IN ITEMS adda_cuda adda_cuda_slice adda_low_mem_double adda_cuda_single adda_single_slice adda_low_mem)
+            if(TARGET ${tgt})
+                target_compile_definitions(${tgt} PRIVATE ADDA_CUDA_INFO)
+            endif()
+        endforeach()
+    endif()
+    message(STATUS "CUDA detailed INFO output: ${INFO}")
+
+    message(STATUS "CUDA backends remain external to CMake/MinGW")
+    message(STATUS "double backend: ${ADDA_CUDA_EXTERNAL_DLL}")
+    message(STATUS "float32 backend: ${ADDA_CUDA_SINGLE_EXTERNAL_DLL}")
 endif()

@@ -467,7 +467,16 @@ WRAPPERS_INTER(InterTerm_fcd_st)
 
 void InterTerm_igt_so(double qvec[static 3],doublecomplex result[static restrict 6])
 {
+#ifdef ADDA_SINGLE
+	/* CalcIGTso is a standalone double-precision routine. Keep its robust
+	 * evaluation and round only the six returned Green components to the
+	 * single-precision ADDA data path. */
+	doublecomplex_t tmp[6];
+	CalcIGTso(qvec,WaveNum,dsX,dsY,dsZ,tmp);
+	for (int i=0;i<6;i++) result[i]=(doublecomplex)tmp[i];
+#else
 	CalcIGTso(qvec,WaveNum,dsX,dsY,dsZ,result);
+#endif
 }
 
 WRAPPERS_INTER(InterTerm_igt_so)
@@ -729,11 +738,19 @@ static inline void SingleSomIntegral(double rho,const double z,doublecomplex val
 	const double scale=WaveNum/TWO_PI;
 	const double isc=pow(scale,3); // this is subject to under/overflow
 
+#ifdef ADDA_SINGLE
+	/* The standalone Sommerfeld code is intentionally kept double precision.
+	 * Convert its compact four-value result at the interface. */
+	complex double tmp[4];
+	evlua(z*scale,rho*scale,tmp,tmp+1,tmp+2,tmp+3,0);
+	for (int i=0;i<4;i++) vals[i]=(doublecomplex)(tmp[i]*isc);
+#else
 	evlua(z*scale,rho*scale,vals,vals+1,vals+2,vals+3,0);
 	vals[0]*=isc;
 	vals[1]*=isc;
 	vals[2]*=isc;
 	vals[3]*=isc;
+#endif
 }
 
 //=====================================================================================================================

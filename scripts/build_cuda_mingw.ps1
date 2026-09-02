@@ -4,7 +4,8 @@ param(
     [string]$Configuration = "Release",
     [string]$CudaArch = "",
     [string]$FftwInclude = "",
-    [string]$FftwLibrary = ""
+    [string]$FftwLibrary = "",
+    [string]$FftwSingleLibrary = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,5 +23,6 @@ $mingwArgs = @{
 }
 if ($FftwInclude) { $mingwArgs["FftwInclude"] = $FftwInclude }
 if ($FftwLibrary) { $mingwArgs["FftwLibrary"] = $FftwLibrary }
+if ($FftwSingleLibrary) { $mingwArgs["FftwSingleLibrary"] = $FftwSingleLibrary }
 & (Join-Path $PSScriptRoot "build_adda_mingw.ps1") @mingwArgs
 exit $LASTEXITCODE

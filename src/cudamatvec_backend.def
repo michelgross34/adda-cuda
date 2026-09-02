@@ -1,5 +1,5 @@
-LIBRARY adda_cuda_backend
 EXPORTS
+    adda_cuda_backend_real_bytes
     adda_cuda_matvec_init
     adda_cuda_matvec_init_slice
     adda_cuda_matvec_init_low_mem
@@ -14,10 +14,10 @@ EXPORTS
     adda_cuda_iter_upload_one
     adda_cuda_iter_download_one
     adda_cuda_iter_release
-    adda_cuda_iter_norm2
     adda_cuda_iter_dotu
     adda_cuda_iter_dotc
     adda_cuda_iter_dotu_self_norm2
+    adda_cuda_iter_norm2
     adda_cuda_iter_copy
     adda_cuda_iter_mult
     adda_cuda_iter_mult_self

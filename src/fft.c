@@ -58,6 +58,19 @@
  */
 #ifdef FFTW3
 #	include <fftw3.h> // types.h or cmplx.h should be defined before (to match C99 complex type)
+#	ifdef ADDA_SINGLE
+/* Compile the same FFT code against FFTW3 single precision. */
+#		define fftw_plan fftwf_plan
+#		define fftw_execute fftwf_execute
+#		define fftw_plan_many_dft fftwf_plan_many_dft
+#		define fftw_plan_guru_dft fftwf_plan_guru_dft
+#		define fftw_destroy_plan fftwf_destroy_plan
+#		define fftw_cleanup fftwf_cleanup
+#		define fftw_iodim fftwf_iodim
+#		define fftw_version fftwf_version
+#		define fftw_cc fftwf_cc
+#		define fftw_codelet_optim fftwf_codelet_optim
+#	endif
 /* define level of planning for usual and Dmatrix (DM) FFT: FFTW_ESTIMATE (heuristics), FFTW_MEASURE (default),
  * FFTW_PATIENT, or FFTW_EXHAUSTIVE
  */
@@ -813,7 +826,11 @@ static void fftInitAfterD(void)
 #	ifdef PRECISE_TIMING
 	SYSTEM_TIME tvp[7];
 #	endif
-	if (IFROOT) PRINTFB("Initializing FFTW3\n");
+#ifdef ADDA_SINGLE
+	if (IFROOT) PRINTFB("Initializing FFTW3 float32 (fftwf)\n");
+#else
+	if (IFROOT) PRINTFB("Initializing FFTW3 double precision\n");
+#endif
 #	ifdef PRECISE_TIMING
 	GET_SYSTEM_TIME(tvp);
 #	endif
