@@ -17,9 +17,6 @@ option(ADDA_ONLY_LOCKFILE "Use lock files only" OFF)
 option(ADDA_OVERRIDE_STDC_TEST "Override the C99 conformance check" OFF)
 option(ADDA_NO_GITHASH "Do not include the current Git revision" OFF)
 option(ADDA_CUDA "Build double-precision CUDA targets" ON)
-option(ADDA_CUDA_SPLIT_BACKEND
-       "Use kernel.cu with the CMake-compiled C++ wrapper backend"
-       ON)
 option(ADDA_CUDA_SLICE "Build double-precision adda_cuda_slice" ON)
 option(ADDA_CUDA_LOW_MEM "Build the preserved double-precision low-memory reference as adda_low_mem_double" ON)
 option(ADDA_SINGLE "Build CPU single-data-path executable adda_single" ON)

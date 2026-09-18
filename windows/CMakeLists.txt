@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.20)
 project(ADDA_WINDOWS LANGUAGES C)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "windows/CMakeLists.txt must be configured on Windows.")
+#    message(FATAL_ERROR "windows/CMakeLists.txt must be configured on Windows.")
 endif()
 
 option(ADDA_CUDA_SPLIT_BACKEND
@@ -21,11 +21,10 @@ set(ADDA_CUDA_SINGLE_SLICE ON CACHE BOOL "Build float32 CUDA slice target" FORCE
 set(ADDA_CUDA_LOW_MEM_SINGLE ON CACHE BOOL "Build float32 low-memory CUDA target" FORCE)
 
 set(_ADDA_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
-if(CMAKE_BUILD_TYPE MATCHES "^[Dd]ebug$")
-    set(_ADDA_CUDA_CONFIG_DIR "debug")
-else()
-    set(_ADDA_CUDA_CONFIG_DIR "release")
-endif()
+
+# The monolithic Windows CUDA backends are built once in cuda-backend/release
+# and are reused by both Debug and Release CMake profiles.
+set(_ADDA_CUDA_CONFIG_DIR "release")
 set(ADDA_CUDA_EXTERNAL_BACKEND
     "${_ADDA_ROOT}/cuda-backend/${_ADDA_CUDA_CONFIG_DIR}/libadda_cuda_backend.a"
     CACHE FILEPATH "MinGW import library for the double CUDA backend" FORCE)

@@ -2,6 +2,17 @@
 set -euo pipefail
 
 # Build every Linux executable and collect runtime files in build_linux/bin.
+#
+# build_cuda_backends.sh first builds BOTH CUDA implementations:
+#   - split kernel libraries from kernel.cu
+#   - monolithic backend libraries from cudamatvec_backend.cu
+#
+# This build_all.sh currently configures ADDA_CUDA_SPLIT_BACKEND=ON, therefore
+# CMake uses the split kernel libraries, compiles wrappermatvec_backend.cpp with
+# GNU g++, and creates libadda_cuda_backend.so / _single.so directly in bin/.
+# The separately-built monolithic backend remains available in
+# cuda-backend/release for ADDA_CUDA_SPLIT_BACKEND=OFF builds.
+#
 # Usage: scripts/build_all.sh [CUDA_ARCH] [JOBS]
 # Example: scripts/build_all.sh 89 8
 
@@ -61,8 +72,22 @@ if [[ ! -f "${script_dir}/build_cuda_backends.sh" ]]; then
 fi
 
 printf '[setup] Parallel jobs: %s\n' "${jobs}"
-printf '[1/4] Building CUDA backends\n'
+printf '[1/4] Building CUDA libraries (split + monolithic)\n'
 bash "${script_dir}/build_cuda_backends.sh" "${cuda_arch}"
+
+# Verify all four CUDA libraries produced by build_cuda_backends.sh.
+cuda_libraries=(
+    "${backend_dir}/kernels/libadda_cuda_kernels.so"
+    "${backend_dir}/kernels/libadda_cuda_kernels_single.so"
+    "${backend_dir}/release/libadda_cuda_backend.so"
+    "${backend_dir}/release/libadda_cuda_backend_single.so"
+)
+for library in "${cuda_libraries[@]}"; do
+    if [[ ! -s ${library} ]]; then
+        printf 'ERROR: required CUDA library not found: %s\n' "${library}" >&2
+        exit 1
+    fi
+done
 
 printf '[2/4] Configuring CMake in %s\n' "${build_dir}"
 cmake -S "${project_root}/linux" -B "${build_dir}" \
@@ -80,6 +105,12 @@ cmake --build "${build_dir}" --config Release --parallel "${jobs}" --target \
 
 printf '[4/4] Collecting shared libraries and AI resources\n'
 mkdir -p "${bin_dir}/ai"
+
+# In split mode, CMake builds libadda_cuda_backend.so and
+# libadda_cuda_backend_single.so directly in build_linux/bin.  Copy only their
+# split-kernel runtime dependencies here.  Do NOT copy the separately-built
+# monolithic libadda_cuda_backend*.so into bin, because they have the same names
+# and would overwrite the split wrapper libraries produced by CMake.
 for library in \
     "${backend_dir}/kernels/libadda_cuda_kernels.so" \
     "${backend_dir}/kernels/libadda_cuda_kernels_single.so"
@@ -90,6 +121,7 @@ do
     fi
     cp -f "${library}" "${bin_dir}/"
 done
+
 if [[ ! -s "${project_root}/ai/lanier_tqc_v1_ema_actor.bin" ]]; then
     printf 'ERROR: AI resource not found: %s\n' \
         "${project_root}/ai/lanier_tqc_v1_ema_actor.bin" >&2
@@ -97,7 +129,7 @@ if [[ ! -s "${project_root}/ai/lanier_tqc_v1_ema_actor.bin" ]]; then
 fi
 cp -a "${project_root}/ai/." "${bin_dir}/ai/"
 
-printf '[verify] Checking executables\n'
+printf '[verify] Checking executables and split CUDA runtime libraries\n'
 executables=(
     adda
     adda_single
@@ -115,7 +147,21 @@ for executable in "${executables[@]}"; do
     fi
 done
 
+runtime_libraries=(
+    "${bin_dir}/libadda_cuda_backend.so"
+    "${bin_dir}/libadda_cuda_backend_single.so"
+    "${bin_dir}/libadda_cuda_kernels.so"
+    "${bin_dir}/libadda_cuda_kernels_single.so"
+)
+for library in "${runtime_libraries[@]}"; do
+    if [[ ! -s ${library} ]]; then
+        printf 'ERROR: runtime CUDA library missing: %s\n' "${library}" >&2
+        exit 1
+    fi
+done
+
 printf '\nComplete Linux build available in: %s\n' "${bin_dir}"
 printf '  %s executables\n' "${#executables[@]}"
-printf '  CUDA shared libraries: %s\n' "${bin_dir}"
+printf '  Split CUDA runtime libraries: %s\n' "${bin_dir}"
+printf '  Monolithic CUDA libraries retained in: %s\n' "${backend_dir}/release"
 printf '  AI resources: %s\n' "${bin_dir}/ai"

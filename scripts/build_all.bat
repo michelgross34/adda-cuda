@@ -121,6 +121,25 @@ echo [1/4] Building CUDA backends
 call "%~dp0build_cuda_backends.bat" "%ARCH%" "%MINGW_BIN%"
 if errorlevel 1 exit /b 1
 
+rem build_cuda_backends.bat always builds both CUDA implementations.  This
+rem build_all currently uses split mode, but verify the monolithic libraries as
+rem well so they are ready for ADDA_CUDA_SPLIT_BACKEND=OFF / CLion profiles.
+for %%F in (
+    "%BACKEND%\kernels\adda_cuda_kernels.dll"
+    "%BACKEND%\kernels\libadda_cuda_kernels.a"
+    "%BACKEND%\kernels\adda_cuda_kernels_single.dll"
+    "%BACKEND%\kernels\libadda_cuda_kernels_single.a"
+    "%BACKEND%\release\adda_cuda_backend.dll"
+    "%BACKEND%\release\libadda_cuda_backend.a"
+    "%BACKEND%\release\adda_cuda_backend_single.dll"
+    "%BACKEND%\release\libadda_cuda_backend_single.a"
+) do (
+    if not exist "%%~F" (
+        echo ERROR: CUDA build output missing: "%%~F"
+        exit /b 1
+    )
+)
+
 echo [2/4] Configuring CMake in "%BUILD%"
 cmake -S "%ROOT%" -B "%BUILD%" -G "!GENERATOR!" ^
     "-DCMAKE_MAKE_PROGRAM=!MAKE_PROGRAM!" ^
