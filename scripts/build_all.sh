@@ -3,15 +3,19 @@ set -euo pipefail
 
 # Build every Linux executable and collect runtime files in build_linux/bin.
 #
-# build_cuda_backends.sh first builds BOTH CUDA implementations:
-#   - split kernel libraries from kernel.cu
-#   - monolithic backend libraries from cudamatvec_backend.cu
+# Linux/WSL always uses the monolithic CUDA backend:
+#   ADDA_CUDA_SPLIT_BACKEND=OFF
 #
-# This build_all.sh currently configures ADDA_CUDA_SPLIT_BACKEND=ON, therefore
-# CMake uses the split kernel libraries, compiles wrappermatvec_backend.cpp with
-# GNU g++, and creates libadda_cuda_backend.so / _single.so directly in bin/.
-# The separately-built monolithic backend remains available in
-# cuda-backend/release for ADDA_CUDA_SPLIT_BACKEND=OFF builds.
+# scripts/build_cuda_backends.sh builds the complete CUDA backends outside CMake:
+#
+#   cuda-backend/debug/libadda_cuda_backend.so
+#   cuda-backend/debug/libadda_cuda_backend_single.so
+#   cuda-backend/release/libadda_cuda_backend.so
+#   cuda-backend/release/libadda_cuda_backend_single.so
+#
+# CMake does NOT compile CUDA sources and does NOT use split kernel libraries
+# on Linux/WSL.  The Release monolithic .so files are copied next to the
+# executables in build_linux/bin.
 #
 # Usage: scripts/build_all.sh [CUDA_ARCH] [JOBS]
 # Example: scripts/build_all.sh 89 8
@@ -20,10 +24,12 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     printf 'Usage: %s [native|all|all-major|SM] [JOBS]\n' "$0"
     exit 0
 fi
+
 if [[ $(uname -s) != "Linux" ]]; then
     printf 'ERROR: this script must run on Linux.\n' >&2
     exit 1
 fi
+
 if (( $# > 2 )); then
     printf 'ERROR: expected at most CUDA_ARCH and JOBS arguments.\n' >&2
     exit 2
@@ -46,12 +52,14 @@ if [[ -z ${jobs} ]]; then
         jobs=1
     fi
 fi
+
 case "${jobs}" in
     *[!0-9]*|'')
         printf 'ERROR: JOBS must be a positive integer.\n' >&2
         exit 2
         ;;
 esac
+
 if (( jobs < 1 )); then
     printf 'ERROR: JOBS must be at least 1.\n' >&2
     exit 2
@@ -61,27 +69,31 @@ if ! command -v cmake >/dev/null 2>&1; then
     printf 'ERROR: cmake was not found in PATH.\n' >&2
     exit 1
 fi
+
 if ! command -v gfortran >/dev/null 2>&1; then
     printf 'ERROR: gfortran was not found in PATH. Fortran is enabled by default.\n' >&2
     exit 1
 fi
+
 fortran_compiler=$(command -v gfortran)
+
 if [[ ! -f "${script_dir}/build_cuda_backends.sh" ]]; then
-    printf 'ERROR: CUDA build script not found: %s\n' "${script_dir}/build_cuda_backends.sh" >&2
+    printf 'ERROR: CUDA build script not found: %s\n' \
+        "${script_dir}/build_cuda_backends.sh" >&2
     exit 1
 fi
 
 printf '[setup] Parallel jobs: %s\n' "${jobs}"
-printf '[1/4] Building CUDA libraries (split + monolithic)\n'
+printf '[1/4] Building monolithic CUDA libraries\n'
 bash "${script_dir}/build_cuda_backends.sh" "${cuda_arch}"
 
-# Verify all four CUDA libraries produced by build_cuda_backends.sh.
+# Linux/WSL uses ADDA_CUDA_SPLIT_BACKEND=OFF.
+# Only the complete monolithic CUDA backends are required.
 cuda_libraries=(
-    "${backend_dir}/kernels/libadda_cuda_kernels.so"
-    "${backend_dir}/kernels/libadda_cuda_kernels_single.so"
     "${backend_dir}/release/libadda_cuda_backend.so"
     "${backend_dir}/release/libadda_cuda_backend_single.so"
 )
+
 for library in "${cuda_libraries[@]}"; do
     if [[ ! -s ${library} ]]; then
         printf 'ERROR: required CUDA library not found: %s\n' "${library}" >&2
@@ -95,7 +107,7 @@ cmake -S "${project_root}/linux" -B "${build_dir}" \
     -DADDA_NO_FORTRAN=OFF \
     -DCMAKE_Fortran_COMPILER="${fortran_compiler}" \
     -DADDA_LINUX_CUDA=ON \
-    -DADDA_CUDA_SPLIT_BACKEND=ON \
+    -DADDA_CUDA_SPLIT_BACKEND=OFF \
     '-DCMAKE_BUILD_RPATH=$ORIGIN'
 
 printf '[3/4] Building all eight executables\n'
@@ -106,14 +118,10 @@ cmake --build "${build_dir}" --config Release --parallel "${jobs}" --target \
 printf '[4/4] Collecting shared libraries and AI resources\n'
 mkdir -p "${bin_dir}/ai"
 
-# In split mode, CMake builds libadda_cuda_backend.so and
-# libadda_cuda_backend_single.so directly in build_linux/bin.  Copy only their
-# split-kernel runtime dependencies here.  Do NOT copy the separately-built
-# monolithic libadda_cuda_backend*.so into bin, because they have the same names
-# and would overwrite the split wrapper libraries produced by CMake.
+# Copy the complete monolithic CUDA runtime libraries next to the executables.
 for library in \
-    "${backend_dir}/kernels/libadda_cuda_kernels.so" \
-    "${backend_dir}/kernels/libadda_cuda_kernels_single.so"
+    "${backend_dir}/release/libadda_cuda_backend.so" \
+    "${backend_dir}/release/libadda_cuda_backend_single.so"
 do
     if [[ ! -s ${library} ]]; then
         printf 'ERROR: required shared library not found: %s\n' "${library}" >&2
@@ -127,9 +135,11 @@ if [[ ! -s "${project_root}/ai/lanier_tqc_v1_ema_actor.bin" ]]; then
         "${project_root}/ai/lanier_tqc_v1_ema_actor.bin" >&2
     exit 1
 fi
+
 cp -a "${project_root}/ai/." "${bin_dir}/ai/"
 
-printf '[verify] Checking executables and split CUDA runtime libraries\n'
+printf '[verify] Checking executables and monolithic CUDA runtime libraries\n'
+
 executables=(
     adda
     adda_single
@@ -140,6 +150,7 @@ executables=(
     adda_single_slice
     adda_low_mem
 )
+
 for executable in "${executables[@]}"; do
     if [[ ! -x "${bin_dir}/${executable}" ]]; then
         printf 'ERROR: executable missing: %s\n' "${bin_dir}/${executable}" >&2
@@ -150,9 +161,8 @@ done
 runtime_libraries=(
     "${bin_dir}/libadda_cuda_backend.so"
     "${bin_dir}/libadda_cuda_backend_single.so"
-    "${bin_dir}/libadda_cuda_kernels.so"
-    "${bin_dir}/libadda_cuda_kernels_single.so"
 )
+
 for library in "${runtime_libraries[@]}"; do
     if [[ ! -s ${library} ]]; then
         printf 'ERROR: runtime CUDA library missing: %s\n' "${library}" >&2
@@ -162,6 +172,6 @@ done
 
 printf '\nComplete Linux build available in: %s\n' "${bin_dir}"
 printf '  %s executables\n' "${#executables[@]}"
-printf '  Split CUDA runtime libraries: %s\n' "${bin_dir}"
-printf '  Monolithic CUDA libraries retained in: %s\n' "${backend_dir}/release"
+printf '  CUDA backend mode: ADDA_CUDA_SPLIT_BACKEND=OFF\n'
+printf '  Monolithic CUDA runtime libraries: %s\n' "${bin_dir}"
 printf '  AI resources: %s\n' "${bin_dir}/ai"
