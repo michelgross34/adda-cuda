@@ -1,0 +1,668 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!60!black,
+  pdftitle={ADDA-CUDA}
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{black!3},
+  frame=single,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\itercmd}[1]{\texttt{-iter #1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{ADDA-CUDA}
+\author{}
+\date{}
+
+\begin{document}
+\sloppy
+
+\maketitle
+
+CUDA acceleration of \href{https://github.com/adda-team/adda}{ADDA}, the
+light-scattering simulator based on the discrete dipole approximation (DDA).
+
+This repository contains a CUDA port developed from the official ADDA source
+tree, while preserving the ADDA calculation pipeline and command-line
+interface.
+
+ADDA calculates electromagnetic scattering and absorption by particles of
+arbitrary shape and composition. It can also handle particles near a plane
+substrate and calculate emission or decay-rate enhancement. See the
+\href{https://github.com/adda-team/adda}{official ADDA project} and the
+\href{https://github.com/adda-team/adda/blob/master/doc/manual.pdf}{ADDA manual} for the physical model and complete list of
+options.
+
+\section{Features}
+
+\begin{itemize}
+  \item CPU and NVIDIA CUDA implementations of the ADDA solver.
+  \item Single precision (\code{float32}) and double precision
+        (\code{float64}) executables.
+  \item Full 3-D GPU FFT implementation.
+  \item Slice-based GPU FFT implementation for reduced VRAM consumption.
+  \item Low-memory CUDA organization for larger problems.
+  \item CUDA-resident iterative solver vectors, avoiding CPU--GPU transfers
+        during the QMR calculation.
+  \item CUDA implementations of the available iterative-solver vector
+        operations.
+  \item Windows build based on Makefiles, MinGW, GCC, G++, and GFortran.
+  \item Native Linux build with GCC, FFTW, CMake, and NVIDIA CUDA.
+  \item Separate CUDA backend compilation with \code{nvcc}, using the Windows
+        \code{.bat} or Linux \code{.sh} script.
+  \item Three-level circulant preconditioners developed from Steven Lanier's
+        work, including \code{lanier_full}, \code{lanier_partition},
+        \code{lanier_nested}, and \code{lanier_multizone}. The \code{ai/}
+        directory contains \code{lanier_tqc_v1_ema_actor.bin}, the trained
+        actor file created by Steven Lanier and used to configure the
+        parameters of the Lanier-preconditioned solver. Reference:
+        \href{https://doi.org/10.1016/j.jqsrt.2025.109741}{Steven Lanier,
+        ``Learning to precondition: Reinforcement learning enhanced three-level
+        circulant preconditioning for the Discrete Dipole Approximation,''
+        JQSRT 350 (2026), 109741}. Scientific details are provided in
+        \href{adda_cuda_extensions.pdf}{\nolinkurl{adda_cuda_extensions.pdf}},
+        \href{adda_cuda_extensions.tex}{\nolinkurl{adda_cuda_extensions.tex}},
+        and
+        \href{adda_cuda_extensions.md}{\nolinkurl{adda_cuda_extensions.md}}.
+  \item Development provenance: the main code was developed from the
+        sequential ADDA repository code, without MPI and without OpenCL, with
+        assistance from ChatGPT Sol 5.6 in web mode. The CUDA port started from
+        upstream ADDA version \code{1.5.0-alpha3}, branch \code{master}, commit
+        \href{https://github.com/adda-team/adda/commit/8f550a7786bd4cff5abf3cb2f2180690a08e1157}{\code{8f550a7786bd4cff5abf3cb2f2180690a08e1157}}
+        (short SHA \code{8f550a7}), authored by Maxim Yurkin and dated
+        30 March 2026 at 08:45:28 UTC, with commit message ``minor changes''. This exact upstream commit is the
+        reference baseline for source-code diffs against ADDA-CUDA. The Lanier
+        preconditioner code was developed from Steven Lanier's article and from
+        written code supplied by Steven Lanier.
+\end{itemize}
+
+
+\section{Split CUDA backend and CLion host debugging}
+
+The default architecture is controlled by:
+
+\begin{lstlisting}
+option(ADDA_CUDA_SPLIT_BACKEND
+       "Use kernel.cu with the CMake-compiled C++ wrapper backend"
+       ON)
+\end{lstlisting}
+
+With \code{ADDA_CUDA_SPLIT_BACKEND=ON}, the backend is separated into three
+parts. \code{src/kernel.cu} contains only CUDA \code{__global__} kernels,
+required \code{__device__} helpers, and C-linkage launch wrappers. It is the
+only source compiled by \code{nvcc}. \code{src/kernel.h} defines the private
+C ABI used by those launch wrappers. \code{src/wrappermatvec_backend.cpp}
+contains the host-side CUDA state, allocations, cuFFT/cuBLAS orchestration,
+MatVec dispatch, iterative-solver and Lanier backend logic, and all public
+functions declared by \code{src/cudamatvec_backend.h}. CMake compiles this file
+with GNU \code{g++}.
+
+The historical \code{src/cudamatvec_backend.cu} is preserved unchanged. When
+\code{ADDA_CUDA_SPLIT_BACKEND=OFF}, CMake uses the historical monolithic
+backend and the existing libraries under \code{cuda-backend/debug/} or
+\code{cuda-backend/release/}.
+
+The public backend ABI is unchanged. The split kernel source is built once for
+double precision and once with \code{ADDA_CUDA_SINGLE_BACKEND} for single
+precision. Both kernel libraries are stored in \code{cuda-backend/kernels/}.
+There is intentionally no separate Debug kernel variant: Debug and Release
+CMake profiles share the same nvcc-built kernel library, while the host wrapper
+is compiled separately with the normal g++ Debug or Release flags.
+
+On native Windows, nvcc uses a supported MSVC host compiler for
+\code{kernel.cu}, while CLion/CMake compile \code{wrappermatvec_backend.cpp}
+with MinGW g++. On Linux and WSL, nvcc builds \code{kernel.cu} and the selected
+Linux/WSL GNU g++ compiles the wrapper. This allows ordinary source-level
+breakpoints and single stepping in the CUDA host code from CLion.
+
+\section{Build scripts and generated files}
+
+With the default split backend, the canonical scripts
+\code{scripts/build_cuda_backends.bat} and
+\code{scripts/build_cuda_backends.sh} compile only \code{src/kernel.cu}. They
+produce one double-precision and one single-precision kernel library in
+\code{cuda-backend/kernels/}. The single-precision build defines
+\code{ADDA_CUDA_SINGLE_BACKEND}. The same kernel binaries are used by Debug and
+Release CMake profiles.
+
+\small
+\begin{longtable}{@{}L{0.14\textwidth}L{0.16\textwidth}L{0.31\textwidth}L{0.29\textwidth}@{}}
+\toprule
+\textbf{Platform} & \textbf{Precision} & \textbf{Kernel runtime} & \textbf{Link input} \\
+\midrule
+\endhead
+Windows & double & \code{cuda-backend/kernels/adda_cuda_kernels.dll} & \code{libadda_cuda_kernels.a} \\
+Windows & single & \code{cuda-backend/kernels/adda_cuda_kernels_single.dll} & \code{libadda_cuda_kernels_single.a} \\
+Linux/WSL & double & \code{cuda-backend/kernels/libadda_cuda_kernels.so} & same \code{.so} \\
+Linux/WSL & single & \code{cuda-backend/kernels/libadda_cuda_kernels_single.so} & same \code{.so} \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+CMake then builds \code{adda_cuda_backend} and
+\code{adda_cuda_backend_single} from \code{src/wrappermatvec_backend.cpp} with
+GNU g++. The historical Debug/Release backend directories are retained for
+\code{ADDA_CUDA_SPLIT_BACKEND=OFF}.
+
+The complete build scripts then create self-contained output directories:
+
+\begin{longtable}{@{}L{0.25\textwidth}L{0.20\textwidth}L{0.47\textwidth}@{}}
+\toprule
+\textbf{Script} & \textbf{Final directory} & \textbf{Files collected there} \\
+\midrule
+\endhead
+\code{scripts/build_all.bat} & \code{build_windows/bin/} & Eight \code{.exe} files, CUDA DLLs, FFTW DLLs, available MinGW runtime DLLs, and \code{ai/} \\
+\code{scripts/build_all.sh} & \code{build_linux/bin/} & Eight Linux executables, both CUDA \code{.so} files, and \code{ai/} \\
+\bottomrule
+\end{longtable}
+
+\code{build_all.bat} accepts an optional CUDA architecture and MinGW
+\code{bin} directory. \code{build_all.sh} accepts an optional CUDA architecture
+and number of parallel jobs. When the job count is omitted, each script detects
+the number of processors available on the current machine.
+
+\section{Executables}
+
+The complete scripts produce the following executables in
+\code{build_windows/bin/} or \code{build_linux/bin/}.
+
+\small
+\begin{longtable}{@{}L{0.18\textwidth}L{0.11\textwidth}L{0.14\textwidth}L{0.22\textwidth}L{0.247\textwidth}@{}}
+\toprule
+\textbf{Executable} & \textbf{Processor} & \textbf{Precision} &
+\textbf{FFT / memory organization} & \textbf{Purpose} \\
+\midrule
+\endhead
+\code{adda.exe} & CPU & double / \code{float64} & Standard FFT & Reference ADDA implementation \\
+\code{adda_single.exe} & CPU & single / \code{float32} & Standard FFT & CPU single-precision comparison \\
+\code{adda_cuda.exe} & NVIDIA GPU & double / \code{float64} & Full 3-D GPU FFT & Accurate CUDA version; highest VRAM use \\
+\code{adda_cuda_single.exe} & NVIDIA GPU & single / \code{float32} & Full 3-D GPU FFT & Lower-memory and faster CUDA version \\
+\code{adda_cuda_slice.exe} & NVIDIA GPU & double / \code{float64} & Slice FFT & Reduced VRAM in double precision \\
+\code{adda_single_slice.exe} & NVIDIA GPU & single / \code{float32} & Slice FFT & Lowest-memory slice variant \\
+\code{adda_low_mem.exe} & NVIDIA GPU & single / \code{float32} & Low-memory layout & Minimum large resident GPU buffers \\
+\code{adda_low_mem_double.exe} & NVIDIA GPU & double / \code{float64} & Low-memory layout & Low-memory layout with double precision \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+The CUDA backend DLLs are:
+
+\begin{longtable}{@{}L{0.31\textwidth}L{0.17\textwidth}L{0.44\textwidth}@{}}
+\toprule
+\textbf{DLL} & \textbf{Precision} & \textbf{Role} \\
+\midrule
+\endhead
+\code{adda_cuda_backend.dll} & double / \code{float64} & CUDA backend for double-precision CUDA executables \\
+\code{adda_cuda_backend_single.dll} & single / \code{float32} & CUDA backend for single-precision CUDA executables \\
+\bottomrule
+\end{longtable}
+
+On Linux/WSL with the split backend, the CMake-built host wrapper libraries
+are emitted beside the executables and depend on the kernel libraries from
+\code{cuda-backend/kernels/}. With \code{ADDA_CUDA_SPLIT_BACKEND=OFF}, the
+historical libraries in \code{cuda-backend/debug/} or
+\code{cuda-backend/release/} are used instead. The Linux executables have the
+same names as in the table above, without the \code{.exe} suffix.
+
+\section{CMake entry points}
+
+The root \code{CMakeLists.txt} contains the shared source lists and build rules.
+The platform-specific files only select the appropriate options and call the
+root configuration, so the source list is not duplicated:
+
+\begin{lstlisting}
+CMakeLists.txt         Shared CMake configuration
+windows/CMakeLists.txt Windows / MinGW / CUDA entry point
+linux/CMakeLists.txt   Linux / CPU and CUDA entry point
+\end{lstlisting}
+
+Use the platform-specific entry point when configuring from a clean checkout.
+Do not configure the Windows build from \code{linux/}, or the Linux build from
+\code{windows/}.
+
+Complete Windows build with MinGW:
+
+\begin{lstlisting}
+scripts\build_all.bat 70 "F:\mingw64_11.2\bin"
+\end{lstlisting}
+
+Complete Linux build for \code{sm_70}:
+
+\begin{lstlisting}
+bash scripts/build_all.sh 70
+\end{lstlisting}
+
+The values \code{70} and \code{sm_70} both select CUDA compute capability 7.0.
+It is the default target used in the commands documented above; use the value
+matching the target GPU when another architecture is required. If the
+architecture argument is omitted, the scripts pass \code{native} to
+\code{nvcc} so it can detect the GPU installed on the build machine.
+
+On Windows, \code{"F:/mingw64_11.2/bin"} is the MinGW \code{bin} directory
+containing \code{gcc.exe}, \code{g++.exe}, and \code{gfortran.exe}. GFortran is
+required by the default complete build. This second argument is optional. When
+it is omitted, \code{build_all.bat} finds \code{gcc.exe} from the Windows
+\code{PATH} and uses the directory containing it.
+
+The root \code{CMakeLists.txt} remains the shared implementation used by both
+entry points.
+
+\section{CLion build}
+
+The project combines three groups of source files:
+
+\begin{itemize}
+  \item C and C++ compilation units and include fragments: \code{src/*.c},
+        \code{src/*.cpp}, and \code{src/*.inc};
+  \item Fortran sources, enabled by default: \code{src/fort/*.f} and
+        \code{src/fort/*.f90};
+  \item CUDA sources: \code{src/*.cu}.
+\end{itemize}
+
+The C sources require the C99 standard, so the Microsoft C/C++ compiler (MSVC)
+cannot be used to compile the ADDA C code. On Windows, however, the CUDA
+compiler \code{nvcc} uses a supported MSVC toolset as its host compiler. CLion
+builds the C, C++, and Fortran sources with the GNU compilers
+\code{gcc}, \code{g++}, and \code{gfortran}, using a MinGW, Linux/System, or
+WSL toolchain.
+
+For the default split backend, run the kernel build script before configuring
+the CUDA targets in CLion:
+
+\begin{lstlisting}[language={}]
+scripts\build_cuda_backends.bat
+\end{lstlisting}
+
+or, on Linux/WSL:
+
+\begin{lstlisting}[language={}]
+bash scripts/build_cuda_backends.sh
+\end{lstlisting}
+
+These scripts compile only \code{src/kernel.cu}; no dedicated CUDA Debug
+variant is required. CMake compiles \code{src/wrappermatvec_backend.cpp} with
+the GNU C++ compiler selected by the CLion toolchain. A Debug profile therefore
+provides normal g++ symbols for the CUDA host code, including allocations,
+cuFFT/cuBLAS orchestration, MatVec dispatch, iterative solver operations, and
+Lanier logic. Kernel source debugging remains a separate CUDA-debugger task.
+Set \code{-DADDA_CUDA_SPLIT_BACKEND=OFF} only when intentionally selecting the
+preserved historical monolithic backend.
+
+Native Windows builds produce \code{.exe} files. Linux and WSL builds produce
+Linux ELF executables, which must be run from Linux or a WSL console. Do not
+configure \code{linux/CMakeLists.txt} with MinGW, or
+\code{windows/CMakeLists.txt} with Linux/WSL.
+
+\section{Command line build}
+
+\subsection{Linux}
+
+Run the complete script from the repository root. The optional first argument
+is the GPU compute capability without the decimal point (\code{70} for
+\code{sm_70}, \code{86} for \code{sm_86}, and so on). The optional second
+argument is the number of parallel jobs:
+
+\begin{lstlisting}
+bash scripts/build_all.sh 70
+\end{lstlisting}
+
+This command creates Debug and Release two precision-specific \code{.so} files
+in \code{cuda-backend/debug/} and \code{cuda-backend/release/}, configures a
+Release build in \code{build_linux/}, builds all eight programs, then copies the shared libraries and the complete
+\code{ai/} directory into \code{build_linux/bin/}.
+
+The final directory contains:
+
+\begin{lstlisting}
+build_linux/bin/
+|-- adda
+|-- adda_single
+|-- adda_cuda
+|-- adda_cuda_single
+|-- adda_cuda_slice
+|-- adda_single_slice
+|-- adda_low_mem
+|-- adda_low_mem_double
+|-- libadda_cuda_backend.so
+|-- libadda_cuda_backend_single.so
+`-- ai/
+\end{lstlisting}
+
+A short CPU single-precision smoke test is:
+
+\begin{lstlisting}
+./build_linux/bin/adda_single -grid 8 8 8 -maxiter 20
+\end{lstlisting}
+
+The Linux configuration deliberately uses the system FFTW libraries rather
+than the Windows libraries stored in \code{fftw/}. Custom native FFTW paths can
+be provided with \code{FFTW3_ROOT}, \code{FFTW3_LIBRARY}, and
+\code{FFTW3F_LIBRARY}.
+
+\subsection{Windows}
+
+From a Windows command prompt, run:
+
+\begin{lstlisting}
+scripts\build_all.bat 70 "F:\mingw64_11.2\bin"
+\end{lstlisting}
+
+The CUDA architecture and MinGW directory are optional. The script first calls
+\code{build_cuda_backends.bat}, configures CMake in \code{build_windows/},
+builds all eight executables, and collects the runtime files in
+\code{build_windows/bin/}.
+
+The resulting directory has the following structure:
+
+\begin{lstlisting}
+build_windows/
+|-- CMakeCache.txt
+|-- CMakeFiles/
+|-- Makefile or build.ninja
+|-- cmake_install.cmake
+`-- bin/
+    |-- adda.exe
+    |-- adda_single.exe
+    |-- adda_cuda.exe
+    |-- adda_cuda_single.exe
+    |-- adda_cuda_slice.exe
+    |-- adda_single_slice.exe
+    |-- adda_low_mem.exe
+    |-- adda_low_mem_double.exe
+    |-- adda_cuda_backend.dll
+    |-- adda_cuda_backend_single.dll
+    |-- libfftw3-3.dll
+    |-- libfftw3f-3.dll
+    |-- available MinGW runtime DLLs
+    `-- ai/
+\end{lstlisting}
+
+The CMake cache, generated build system, and object files remain under
+\code{build_windows/}. Only \code{build_windows/bin/} is intended as the
+runtime directory. The CUDA import libraries remain in \code{cuda-backend/};
+only the CUDA DLLs are copied beside the executables.
+
+To rebuild only the CUDA libraries and their import libraries, run:
+
+\begin{lstlisting}
+scripts\build_cuda_backends.bat 70 "F:\mingw64_11.2\bin"
+\end{lstlisting}
+
+This backend-only command writes Debug and Release double- and
+single-precision DLLs, MSVC \code{.lib} files, and MinGW \code{.a} import
+libraries to \code{cuda-backend/debug/} and \code{cuda-backend/release/}. It
+does not rebuild the eight ADDA executables.
+
+\section{Requirements}
+
+\subsection{Linux}
+
+\begin{itemize}
+  \item C and Fortran compilers supported by the project (GCC and GFortran are
+        the tested configuration).
+  \item CMake 3.20 or newer and either Make or Ninja.
+  \item FFTW development libraries for both precisions. On Debian/Ubuntu,
+        install \code{libfftw3-dev}.
+  \item For the CUDA targets: an NVIDIA CUDA Toolkit providing \code{nvcc},
+        cuFFT, and cuBLAS. A compatible NVIDIA GPU and driver are required to
+        run the CUDA executables.
+\end{itemize}
+
+For example, on Debian/Ubuntu:
+
+\begin{lstlisting}
+sudo apt update
+sudo apt install build-essential gfortran cmake libfftw3-dev
+\end{lstlisting}
+
+Install the NVIDIA CUDA Toolkit separately if \code{nvcc --version} is not
+available. The distribution package name and supported CUDA version depend on
+the Linux and NVIDIA driver versions.
+
+\clearpage
+\subsection{Windows}
+
+\begin{itemize}
+  \item 64-bit Windows.
+  \item MinGW-w64 with GCC, GFortran, and \code{dlltool}.
+  \item CMake and either MinGW Makefiles or Ninja.
+  \item NVIDIA GPU and a compatible NVIDIA driver.
+  \item NVIDIA CUDA Toolkit with \code{nvcc} and a supported MSVC host compiler
+        (\code{cl.exe}).
+  \item The FFTW headers, import libraries, and runtime DLLs stored in
+        \code{fftw/}.
+\end{itemize}
+
+The root \code{CMakeLists.txt} builds the ADDA C and Fortran sources by default.
+\code{scripts/build_all.bat} follows this CMake setting: it does not override
+\code{ADDA_NO_FORTRAN}, and puts the selected MinGW \code{bin} directory first
+in \code{PATH} so CMake can discover the matching GNU compilers. It also copies
+the available GFortran runtime DLLs beside the executables when they are
+present. To disable Fortran, change the default in \code{CMakeLists.txt} or
+configure with \code{-DADDA_NO_FORTRAN=ON}. The CUDA \code{.cu} source remains
+compiled separately by \code{nvcc}, which uses the supported MSVC host compiler
+on Windows.
+
+\section{The \texorpdfstring{\texttt{fftw/}}{fftw/} directory}
+
+The \code{fftw/} directory is not included in this GitHub repository. Before
+the standard Windows build, the user must download or copy a compatible
+Windows FFTW3 distribution into the repository root as \code{fftw/}. CMake
+detects this directory automatically when \code{fftw/fftw3.h} is present.
+Alternatively, an existing FFTW installation can be selected explicitly with
+the CMake variables shown below.
+
+The files most useful for building ADDA on Windows are:
+
+\begin{longtable}{@{}L{0.30\textwidth}L{0.62\textwidth}@{}}
+\toprule
+\textbf{File} & \textbf{Purpose} \\
+\midrule
+\endhead
+\code{fftw3.h} & FFTW3 C header included by ADDA \\
+\code{libfftw3.dll.a} & MinGW import library for double precision \\
+\code{libfftw3-3.dll} & Runtime DLL for double-precision CPU/CUDA executables \\
+\code{libfftw3f.dll.a} & MinGW import library for single precision \\
+\code{libfftw3f-3.dll} & Runtime DLL for single-precision executables \\
+\code{libfftw3.a}, \code{libfftw3f.a} & Static libraries, available for alternative link configurations \\
+\bottomrule
+\end{longtable}
+
+The directory also contains FFTW Fortran interfaces, long-double/quadruple
+precision variants, threaded/OpenMP variants, and FFTW wisdom utilities. They
+are not required by the default ADDA CMake targets. The CMake build copies the
+appropriate \code{libfftw3-3.dll} or \code{libfftw3f-3.dll} next to each
+executable.
+
+For a different FFTW installation, override the automatic detection, for
+example:
+
+\begin{lstlisting}
+cmake -S windows -B build_windows -G Ninja `
+  -DFFTW3_ROOT="C:/path/to/fftw" `
+  -DFFTW3_LIBRARY="C:/path/to/fftw/libfftw3.dll.a" `
+  -DFFTW3F_LIBRARY="C:/path/to/fftw/libfftw3f.dll.a"
+\end{lstlisting}
+
+On Linux, the files in this Windows-oriented \code{fftw/} directory should not
+be used as native libraries. Install FFTW for Linux or provide Linux-compatible
+paths through \code{FFTW3_ROOT}, \code{FFTW3_LIBRARY}, and
+\code{FFTW3F_LIBRARY}.
+
+The names above describe the builds tested on Windows on 28 August 2026. The
+repository contains source code and build scripts; compiled binaries are not
+required to be committed to Git.
+
+\section{Precision and convergence}
+
+Single precision reduces the storage required by complex vectors and FFT
+workspaces by approximately a factor of two. It is useful for problems that do
+not fit in GPU memory in double precision, but it also reduces the attainable
+numerical accuracy and can make iterative convergence more difficult.
+
+Double precision is recommended for validation, difficult or poorly
+conditioned problems, and final production results. In single precision,
+\code{qmr2} is often preferable to \code{qmr} because it has better round-off
+properties. The final residual can be checked with:
+
+\begin{lstlisting}
+adda_cuda_single.exe ... -iter qmr2 -recalc_resid
+\end{lstlisting}
+
+For CUDA single-precision calculations, the \code{-reliable_resid} option
+periodically evaluates the true residual instead of relying only on the
+recursively estimated residual. It is intended to limit residual drift and
+improve convergence reliability. In the current implementation it applies to
+CUDA \code{float32} BiCGStab(2)/BCGS2 and GPBiCGStab(2):
+
+\begin{lstlisting}
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid
+adda_cuda_single.exe ... -iter gpbicgstab2 -reliable_resid
+\end{lstlisting}
+
+The true residual is checked every 20 iterations. With
+\code{-reliable_resid}, the Krylov calculation is restarted only when the
+discrepancy indicates a significant residual error. With
+\code{-reliable_resid_force_restart}, a restart is forced at every 20-iteration
+check, even when the recursively estimated residual is still considered
+reliable; this option implies \code{-reliable_resid}.
+
+Examples:
+
+\begin{lstlisting}
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid
+adda_cuda_single.exe ... -iter bcgs2 -reliable_resid_force_restart
+\end{lstlisting}
+
+These options are ignored for unsupported solvers or for
+non-CUDA/non-single-precision builds. They can be combined with
+\code{-recalc_resid} when a final independent residual check is required.
+
+\section{Iterative solvers}
+
+Compared with the original ADDA solver set, this version adds iterative
+solvers also available in
+\href{https://www.fresnel.fr/perso/chaumet/ifdda.html}{IFDDA}:
+
+The command-line syntax is \texttt{-iter SOLVER}; the space between
+\texttt{-iter} and the solver name is required.
+
+\begin{longtable}{@{}L{0.31\textwidth}L{0.31\textwidth}L{0.28\textwidth}@{}}
+\toprule
+\textbf{Solver} & \textbf{Command-line option} & \textbf{Alias} \\
+\midrule
+\endhead
+Bi-CGStab(2) & \itercmd{bcgs2} & \itercmd{bicgstab2} \\
+Bi-CG & \itercmd{bicg} & \\
+Bi-CGStab & \itercmd{bicgstab} & \\
+CGNR & \itercmd{cgnr} & \\
+CSYM & \itercmd{csym} & \\
+QMR & \itercmd{qmr} & \\
+QMR2 & \itercmd{qmr2} & \\
+BiCGStab(4) & \itercmd{bicgstab4} & \itercmd{bicgstabl4} \\
+BiCGStab(8) & \itercmd{bicgstab8} & \itercmd{bicgstabl8} \\
+BiCGStab(12) & \itercmd{bicgstab12} & \itercmd{bicgstabl12} \\
+GPBiCGStab(2) & \itercmd{gpbicgstab2} & \itercmd{gpbicgstabl2} \\
+GPBiCGStab(4) & \itercmd{gpbicgstab4} & \itercmd{gpbicgstabl4} \\
+\bottomrule
+\end{longtable}
+
+The default solver remains \code{qmr}. For single-precision calculations,
+\code{qmr2} is a useful first choice when round-off limits convergence.
+
+\section{Running ADDA}
+
+ADDA uses command-line options. For example, a 32-cubed grid and refractive
+index 1.6 can be requested with options of the following form:
+
+\begin{lstlisting}
+adda_cuda_single.exe -grid 32 -m 1.6 0 ...
+\end{lstlisting}
+
+The complete syntax, geometry options, material definitions, solver options,
+and output files are documented in the \href{https://github.com/adda-team/adda/blob/master/doc/manual.pdf}{ADDA manual}. Use
+\code{-h} for the help available in the executable.
+
+\section{Repository layout}
+
+\begin{lstlisting}
+src/                       ADDA C sources and CUDA integration
+src/kernel.cu             CUDA kernels and nvcc launch wrappers
+src/kernel.h              Private C launch-wrapper ABI
+src/wrappermatvec_backend.cpp Host CUDA backend compiled by g++
+src/cudamatvec_backend.cu Preserved historical monolithic backend
+cuda-backend/              Separate CUDA backend build files
+scripts/                   Windows and Linux CUDA build scripts
+tests/                     Regression and CUDA tests
+third_party/               Required third-party headers
+doc/                       ADDA documentation
+\end{lstlisting}
+
+\section{Relationship to ADDA}
+
+ADDA-CUDA is based on the source code of the official
+\href{https://github.com/adda-team/adda}{ADDA project}. The upstream baseline
+used to start the CUDA port is ADDA version \code{1.5.0-alpha3}, branch
+\code{master}, commit
+\href{https://github.com/adda-team/adda/commit/8f550a7786bd4cff5abf3cb2f2180690a08e1157}{\code{8f550a7786bd4cff5abf3cb2f2180690a08e1157}}
+(short SHA \code{8f550a7}), authored by Maxim Yurkin and dated 30 March 2026
+at 08:45:28 UTC. The commit message is ``minor changes''. Using this exact commit as the upstream baseline
+makes it possible to compare ADDA-CUDA with the original ADDA source using a
+Git diff. The CUDA implementation is adapted to ADDA's C99 code, FFT pipeline,
+complex arithmetic, and iterative solvers.
+
+For the original ADDA scientific references, capabilities, limitations, and
+licensing information, please consult the official ADDA repository and the
+\href{https://github.com/adda-team/adda/blob/master/doc/manual.pdf}{ADDA manual}.
+This project is intended to remain compatible with the upstream ADDA
+command-line workflow wherever the CUDA implementation permits.
+
+\section{License and citation}
+
+ADDA is distributed under the GNU General Public License. Please consult the
+license and attribution information in the upstream project before
+redistributing modified versions.
+
+If results obtained with adda-cuda are published, please cite the original ADDA work and the relevant discrete-dipole-approximation references listed in the official ADDA documentation. Please also reference the adda-cuda repository:
+\href{https://github.com/michelgross34/adda-cuda}{ \nolinkurl{https://github.com/michelgross34/adda-cuda}}
+
+
+
+For reproducibility, please also report the ADDA-CUDA release tag or commit SHA
+used for the published calculations. If a Lanier preconditioner is used, please
+also cite Steven Lanier's paper:
+\href{https://doi.org/10.1016/j.jqsrt.2025.109741}{``Learning to precondition:
+Reinforcement learning enhanced three-level circulant preconditioning for the
+Discrete Dipole Approximation,'' JQSRT 350 (2026), 109741}.
+
+\section{Status}
+
+This repository is an experimental CUDA extension of ADDA. CPU and CUDA
+results should be compared on representative cases, especially when using
+single precision, slice FFT, or low-memory modes. Numerical agreement and
+convergence should be validated before using a configuration for production
+calculations.
+
+\end{document}

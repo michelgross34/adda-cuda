@@ -1,5 +1,6 @@
 LIBRARY adda_cuda_backend_single
 EXPORTS
+    adda_cuda_backend_real_bytes
     adda_cuda_matvec_init
     adda_cuda_matvec_init_slice
     adda_cuda_matvec_init_low_mem
@@ -7,6 +8,39 @@ EXPORTS
     adda_cuda_memory_info
     adda_cuda_matvec_execute
     adda_cuda_matvec_execute_gpu
+    adda_cuda_lanier_init
+    adda_cuda_lanier_release
+    adda_cuda_lanier_apply
+    adda_cuda_lanier_matvec_right
+    adda_cuda_lanier_matvec_congruence
+    adda_cuda_lanier_axpy
+    adda_cuda_lanier_full_predict
+    adda_cuda_lanier_full_apply
+    adda_cuda_lanier_full_matvec_right
+    adda_cuda_lanier_full_matvec_congruence
+    adda_cuda_lanier_full_axpy
+    adda_cuda_lanier_set_region
+    adda_cuda_set_material_projection
+    adda_cuda_lanier_nested_init_slot
+    adda_cuda_lanier_nested_release
+    adda_cuda_lanier_nested_apply
+    adda_cuda_lanier_nested_matvec_right
+    adda_cuda_lanier_nested_matvec_congruence
+    adda_cuda_lanier_nested_axpy
+    adda_cuda_lanier_schwarz_apply
+    adda_cuda_lanier_schwarz_matvec_right
+    adda_cuda_lanier_schwarz_axpy
+    adda_cuda_lanier_schwarz_reverse_apply
+    adda_cuda_lanier_schwarz_reverse_matvec_right
+    adda_cuda_lanier_schwarz_reverse_axpy
+    adda_cuda_lanier_schur_set_omega
+    adda_cuda_lanier_schur_prepare
+    adda_cuda_lanier_schur_apply
+    adda_cuda_lanier_schur_matvec_right
+    adda_cuda_lanier_schur_axpy
+    adda_cuda_lanier_schwarz_sym_apply
+    adda_cuda_lanier_schwarz_sym_matvec_right
+    adda_cuda_lanier_schwarz_sym_axpy
     adda_cuda_iter_init
     adda_cuda_iter_init_list
     adda_cuda_iter_upload_all

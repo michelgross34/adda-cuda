@@ -64,6 +64,18 @@ extern unsigned char * restrict material;
 // iterative solver
 extern enum iter IterMethod;
 extern int maxiter;
+extern bool lanier_precon;          // any CUDA Lanier right preconditioner is active
+extern bool lanier_full_precon;     // separate TQC-v1 FULL6 Lanier path
+extern bool lanier_partition_precon; // partitioned Lanier pre-solve for separated multi-material regions
+extern bool lanier_nested_precon;    // block-Jacobi FULL6 preconditioner for touching/nested multi-material regions
+extern bool lanier_multizone_precon; // N-zone strict-mask FULL6 block preconditioner; one ADDA domain per zone
+extern bool lanier_multizone_schwarz_precon; // multiplicative Schwarz / forward block-Gauss-Seidel multizone mode
+extern bool lanier_multizone_schwarz_sym_precon; // forward+backward regional sweep
+extern bool lanier_multizone_schwarz_reverse_precon; // reverse multiplicative Schwarz: descending ADDA-domain order
+extern bool lanier_multizone_schur_precon; // nearest-neighbor approximate Schur-LDU multizone mode
+extern bool lanier_partition_local_mode; // internal local partition solve flag
+extern int lanier_partition_active_material; // internal active material index
+extern double lanier_expansion;    // selected reference auxiliary-grid factor: 1.0 or 1.5
 extern doublecomplex *xvec,*pvec,* restrict Einc;
 
 // scattering at different angles

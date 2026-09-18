@@ -113,7 +113,8 @@ VALID_OPTS := DEBUG DEBUGFULL FFT_TEMPERTON PRECISE_TIMING NOT_USE_LOCK ONLY_LOC
 #override OPTIONS += NOT_USE_LOCK
 #override OPTIONS += ONLY_LOCKFILE
 
-# This should be uncommented, if compiling of Fortran sources cause problems. However, currently a number of ADDA
+# Fortran sources are compiled by default. The following option should be uncommented only if compiling Fortran causes
+# problems. However, currently a number of ADDA
 # (optional) features rely on Fortran sources, in particular: IGT, Temperton FFT. This features will not work if line
 # below is uncommented.
 #override OPTIONS += NO_FORTRAN

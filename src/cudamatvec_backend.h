@@ -84,6 +84,7 @@ typedef struct AddaCudaMemoryInfo {
     size_t reduction_scratch_bytes;   /* float32 backend: chunked FP64 cuBLAS reduction scratch */
     size_t matvec_vector_bytes;       /* d_arg + d_result */
     size_t iterative_vector_bytes;    /* solver-specific resident vectors */
+    size_t lanier_workspace_bytes;    /* Lanier compact/grid/coeff workspaces, including nested blocks */
     size_t cc_bytes;                  /* cc_sqrt */
     size_t material_bytes;            /* material */
     size_t position_bytes;            /* position */
@@ -105,6 +106,116 @@ int adda_cuda_matvec_execute(const void *argvec, void *resultvec, int her,
  * No H2D/D2H vector copy is performed by this call. */
 int adda_cuda_matvec_execute_gpu(const void *argvec_id, const void *resultvec_id,
                                  int her, double *inprod, double *elapsed_ms);
+
+/* ADDA_LANIER_REFERENCE15X_V4
+ * Homogeneous 3-D circulant preconditioner for the transformed ADDA system
+ * A = I + S D S. The CPU builder precomputes six reduced inverse spectra
+ * (1x or 1.5x auxiliary grid), which are uploaded once. Application stays
+ * GPU-resident and owns its own auxiliary 3-D FFT independently of whether
+ * the physical MatVec backend is full-grid, slice, or low-memory. */
+int adda_cuda_lanier_init(size_t nx,size_t ny,size_t nz,
+                          size_t rx,size_t ry,size_t rz,
+                          const void *inverse6_reduced,size_t complex_count);
+int adda_cuda_lanier_release(void);
+int adda_cuda_lanier_apply(const void *src_id, const void *dst_id);
+int adda_cuda_lanier_matvec_right(const void *src_id, const void *dst_id,
+                                  int her, double *inprod);
+int adda_cuda_lanier_matvec_congruence(const void *src_id, const void *dst_id,
+                                       double *inprod);
+int adda_cuda_lanier_axpy(const void *dst_id, const void *src_id,
+                          double alpha_re, double alpha_im);
+
+/* LANIER_FULL_TQC_V1: separate full preconditioner path. The current
+ * lanier/lanier1x/lanier15x ABI above is preserved unchanged. */
+typedef struct AddaCudaLanierFullPrediction {
+    float features[18];
+    float action[6];
+    float alpha_re, alpha_im;
+    float max_alpha_mag;
+    float k_shift, l_shift, blend_weight, shift_radius;
+    int occupied_count;
+} AddaCudaLanierFullPrediction;
+
+int adda_cuda_lanier_full_predict(const void *cc_sqrt, size_t complex_count,
+                                  const unsigned char *material,
+                                  const unsigned short *position, size_t ndip,
+                                  int boxX, int boxY, int boxZ, double kd, double dipvol,
+                                  const char *actor_path,
+                                  AddaCudaLanierFullPrediction *out);
+int adda_cuda_lanier_full_apply(const void *src_id, const void *dst_id);
+int adda_cuda_lanier_full_matvec_right(const void *src_id, const void *dst_id,
+                                       int her, double *inprod);
+int adda_cuda_lanier_full_matvec_congruence(const void *src_id, const void *dst_id,
+                                            double *inprod);
+int adda_cuda_lanier_full_axpy(const void *dst_id, const void *src_id,
+                               double alpha_re, double alpha_im);
+
+/* LANIER_PARTITION_V2 support. A regional FULL6 preconditioner reuses the
+ * normal Lanier storage but addresses a material-local bounding box. The
+ * material projection restricts the physical MatVec rows to one partition,
+ * yielding the diagonal block A_ii while retaining the full Green operator. */
+int adda_cuda_lanier_set_region(int active_material,size_t x0,size_t y0,size_t z0);
+int adda_cuda_set_material_projection(int active_material); /* -1 disables */
+
+/* LANIER_NESTED / LANIER_MULTIZONE: fixed strict-mask block-Jacobi FULL6
+ * preconditioner. One state is cached per ADDA domain block. The same ABI is
+ * used for two-block nested particles and N-zone geometries (up to 60 zones). */
+int adda_cuda_lanier_nested_init_slot(int slot,int active_material,
+                                      size_t x0,size_t y0,size_t z0,
+                                      size_t nx,size_t ny,size_t nz,
+                                      size_t rx,size_t ry,size_t rz,
+                                      const void *inverse6_reduced,size_t complex_count);
+int adda_cuda_lanier_nested_release(void);
+int adda_cuda_lanier_nested_apply(const void *src_id,const void *dst_id);
+int adda_cuda_lanier_nested_matvec_right(const void *src_id,const void *dst_id,
+                                         int her,double *inprod);
+int adda_cuda_lanier_nested_matvec_congruence(const void *src_id,const void *dst_id,
+                                              double *inprod);
+int adda_cuda_lanier_nested_axpy(const void *dst_id,const void *src_id,
+                                 double alpha_re,double alpha_im);
+
+/* LANIER_MULTIZONE_SCHWARZ: fixed-order multiplicative Schwarz (forward
+ * block Gauss--Seidel) using the same per-zone FULL6 states.  The operator is
+ * nonsymmetric, therefore this V1 API intentionally exposes right
+ * preconditioning only; no congruence/Hermitian-adjoint entry point is
+ * provided. */
+int adda_cuda_lanier_schwarz_apply(const void *src_id,const void *dst_id);
+int adda_cuda_lanier_schwarz_matvec_right(const void *src_id,const void *dst_id,
+                                          double *inprod);
+int adda_cuda_lanier_schwarz_axpy(const void *dst_id,const void *src_id,
+                                  double alpha_re,double alpha_im);
+
+/* LANIER_MULTIZONE_SCHWARZ_REVERSE: same multiplicative Schwarz construction
+ * as the forward mode, but the strict-mask FULL6 blocks are traversed in
+ * descending ADDA-domain order N..1. It is a fixed nonsymmetric right
+ * preconditioner. */
+int adda_cuda_lanier_schwarz_reverse_apply(const void *src_id,const void *dst_id);
+int adda_cuda_lanier_schwarz_reverse_matvec_right(const void *src_id,const void *dst_id,
+                                                  double *inprod);
+int adda_cuda_lanier_schwarz_reverse_axpy(const void *dst_id,const void *src_id,
+                                          double alpha_re,double alpha_im);
+
+/* LANIER_MULTIZONE_SCHUR V2.1: damped ordered nearest-neighbor approximate Schur-LDU
+ * chain. Each strict-mask FULL6 block B_i receives one first-order interface
+ * feedback term B_i A_i,i-1 B_i-1 A_i-1,i B_i. Domain IDs define the chain
+ * order. This is a fixed nonsymmetric right preconditioner. */
+int adda_cuda_lanier_schur_set_omega(double omega);
+int adda_cuda_lanier_schur_prepare(void);
+int adda_cuda_lanier_schur_apply(const void *src_id,const void *dst_id);
+int adda_cuda_lanier_schur_matvec_right(const void *src_id,const void *dst_id,
+                                        double *inprod);
+int adda_cuda_lanier_schur_axpy(const void *dst_id,const void *src_id,
+                                double alpha_re,double alpha_im);
+
+/* LANIER_MULTIZONE_SCHWARZ_SYM: forward sweep followed immediately by the
+ * reverse sweep (1..N..1). It uses the same strict-mask FULL6 blocks and the
+ * same shared FFT grid/workspace as LANIER_MULTIZONE V2. V1 exposes it as a
+ * fixed right preconditioner; no transpose/congruence assumption is made. */
+int adda_cuda_lanier_schwarz_sym_apply(const void *src_id,const void *dst_id);
+int adda_cuda_lanier_schwarz_sym_matvec_right(const void *src_id,const void *dst_id,
+                                              double *inprod);
+int adda_cuda_lanier_schwarz_sym_axpy(const void *dst_id,const void *src_id,
+                                      double alpha_re,double alpha_im);
 
 /* Register vectors used by the selected iterative solver and upload current
  * host values. The legacy entry point covers vec1..vec7; the list entry point

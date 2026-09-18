@@ -34,6 +34,7 @@
 // system headers
 #include <math.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h> // for time_t & time
 
@@ -106,8 +107,31 @@ static bool chp_exit;      // checkpoint occurred - exit
 static bool complete;      // complete iteration was performed (not stopped in the middle)
 	// whether matrix-vector product computed during initialization can be reused at first iteration
 static bool matvec_ready;
+#ifdef ADDA_CUDA
+/* LANIER_PARTITION_V2 asks the ordinary solver core to keep the transformed
+ * xvec supplied by the previous regional/full solve instead of rebuilding an
+ * initial field from InitField. */
+static bool lanier_partition_use_existing_x=false;
+static bool lanier_partition_internal_call=false;
+#endif
 static bool gp2_restart_request; // request PHASE_INIT to rebuild GPBiCGStab(2) after a true-residual check
 static bool bcgs2_restart_request; // request PHASE_INIT to rebuild BiCGStab(2)/BCGS2 after a true-residual check
+/* This flag is referenced by solver PHASE_INIT code in all builds, but it is
+ * only asserted by the CUDA LANIER_FULL reliable-residual controller. */
+static bool lanier_hard_restart_request=false;
+#ifdef ADDA_CUDA
+/* LANIER_FULL uses the DDSCAT hard-reset/reliable-residual policy for every
+ * CUDA solver and every CUDA executable (full, slice, low-memory; single/double).
+ * A hard restart keeps the current physical solution x, replaces the recurrence
+ * residual by an independently recomputed one, and rebuilds only Krylov history. */
+static bool lanier_true_converged=false;
+static double lanier_physical_rhs_norm2=0.0;
+static double lanier_reset_baseline=1.0;
+static int lanier_reset_mandatory_count=0;
+static int lanier_reset_ratio_count=0;
+static int lanier_reset_reliable_count=0;
+static doublecomplex *lanier_recursive_residual_vec=NULL;
+#endif
 typedef struct // data for checkpoints
 {
 	void *ptr; // pointer to the data
@@ -138,6 +162,8 @@ ITER_FUNC(BCGS2);
 ITER_FUNC(BiCG_CS);
 ITER_FUNC(BiCGStab);
 ITER_FUNC(BiCGStab4);
+ITER_FUNC(BiCGStab8);
+ITER_FUNC(BiCGStab12);
 ITER_FUNC(CGNR);
 ITER_FUNC(CSYM);
 ITER_FUNC(GPBiCGStab2);
@@ -154,6 +180,8 @@ static const struct iter_params_struct params[]={
 	{IT_BICG_CS,50000,1,0,BiCG_CS},
 	{IT_BICGSTAB,30000,3,3,BiCGStab},
 	{IT_BICGSTAB4,30000,3,9,BiCGStab4},
+	{IT_BICGSTAB8,30000,3,17,BiCGStab8},
+	{IT_BICGSTAB12,30000,3,25,BiCGStab12},
 	{IT_CGNR,10,1,0,CGNR},
 	{IT_CSYM,10,6,2,CSYM},
 	{IT_GPBICGSTAB2,30000,1,7,GPBiCGStab2},
@@ -459,10 +487,74 @@ static double ResidualNorm2(doublecomplex * restrict x,doublecomplex * restrict 
 
 /* Large-vector operations inside all iterative solvers stay in C source. In
  * the CUDA executable they dispatch to resident GPU vectors; the normal build
- * continues to call the original linalg.c/MatVec routines. */
+ * continues to call the original linalg.c/MatVec routines.
+ *
+ * LANIER_FULL integration:
+ *  - general Krylov methods use the exact right-preconditioned operator A*P;
+ *  - CGNR additionally uses (A*P)^H=P^H*A^H;
+ *  - complex-symmetric methods use the congruence P*A*P so their required
+ *    transpose symmetry is preserved. Their residual is converted to P*r0
+ *    once before PHASE_INIT.
+ * In every case xvec remains the physical ADDA solution because every solver
+ * update x += alpha*d is mapped to x += alpha*P*d. */
 #ifdef ADDA_CUDA
-# define IT_MATVEC                 MatVec_GPU
-# define BICGCS_MATVEC             MatVec_GPU
+static bool lanier_cs_congruence=false;
+
+static bool LanierComplexSymmetricMethod(const enum iter method)
+{
+    return method==IT_BICG_CS || method==IT_CSYM ||
+           method==IT_QMR_CS || method==IT_QMR_CS_2;
+}
+
+static bool LanierSchwarzSupportedMethod(const enum iter method)
+{
+    /* V1 intentionally supports only methods that need A*P, not P^H*A^H or
+     * complex-symmetric congruence. */
+    return method==IT_BCGS2 || method==IT_BICGSTAB || method==IT_BICGSTAB4 ||
+           method==IT_GPBICGSTAB2 || method==IT_GPBICGSTAB4;
+}
+
+static void KrylovMatVec(doublecomplex * restrict in,doublecomplex * restrict out,double *inprod,
+                         const bool her,TIME_TYPE *timing,TIME_TYPE *comm_timing)
+{
+    if (!lanier_precon) MatVec_GPU(in,out,inprod,her,timing,comm_timing);
+    else if (lanier_cs_congruence) {
+        if (her) LogError(ONE_POS,"Internal error: Hermitian MatVec requested for Lanier complex-symmetric congruence mode");
+        CudaLanierMatVecCongruence(in,out,inprod,timing,comm_timing);
+    }
+    else CudaLanierMatVec(in,out,inprod,her,timing,comm_timing);
+}
+
+static void KrylovXIncrem(const doublecomplex * restrict direction)
+{
+    if (lanier_precon) CudaLanierAxpy(xvec,direction,1.0);
+    else CudaIterIncrem(xvec,direction,NULL,NULL);
+}
+
+static void KrylovXIncrem01(const doublecomplex * restrict direction,const double alpha)
+{
+    if (lanier_precon) CudaLanierAxpy(xvec,direction,alpha);
+    else CudaIterIncrem01(xvec,direction,alpha,NULL,NULL);
+}
+
+static void KrylovXIncrem01Cmplx(const doublecomplex * restrict direction,const itercomplex alpha)
+{
+    if (lanier_precon) CudaLanierAxpy(xvec,direction,(double complex)alpha);
+    else CudaIterIncrem01_cmplx(xvec,direction,(double complex)alpha,NULL,NULL);
+}
+
+static void KrylovXIncrem011Cmplx(const doublecomplex * restrict d1,const doublecomplex * restrict d2,
+                                  const itercomplex a1,const itercomplex a2)
+{
+    if (lanier_precon) {
+        CudaLanierAxpy(xvec,d1,(double complex)a1);
+        CudaLanierAxpy(xvec,d2,(double complex)a2);
+    }
+    else CudaIterIncrem011_cmplx(xvec,d1,d2,(double complex)a1,(double complex)a2);
+}
+
+# define IT_MATVEC                 KrylovMatVec
+# define BICGCS_MATVEC             KrylovMatVec
 # define IT_COPY                   CudaIterCopy
 # define IT_NORM2                  CudaIterNorm2
 # define IT_DOT                    CudaIterDotProd
@@ -487,6 +579,10 @@ static double ResidualNorm2(doublecomplex * restrict x,doublecomplex * restrict 
 # define IT_LINCOMB_CMPLX          CudaIterLinComb_cmplx
 # define IT_LINCOMB1_CMPLX         CudaIterLinComb1_cmplx
 # define IT_LINCOMB1_CMPLX_CONJ    CudaIterLinComb1_cmplx_conj
+# define IT_X_INCREM(d)            KrylovXIncrem((d))
+# define IT_X_INCREM01(d,a)        KrylovXIncrem01((d),(a))
+# define IT_X_INCREM01_CMPLX(d,a)  KrylovXIncrem01Cmplx((d),(a))
+# define IT_X_INCREM011_CMPLX(d1,d2,a1,a2) KrylovXIncrem011Cmplx((d1),(d2),(a1),(a2))
 #else
 # define IT_MATVEC                 MatVec
 # define BICGCS_MATVEC             MatVec_wrapper
@@ -514,57 +610,120 @@ static double ResidualNorm2(doublecomplex * restrict x,doublecomplex * restrict 
 # define IT_LINCOMB_CMPLX          nLinComb_cmplx
 # define IT_LINCOMB1_CMPLX         nLinComb1_cmplx
 # define IT_LINCOMB1_CMPLX_CONJ    nLinComb1_cmplx_conj
+# define IT_X_INCREM(d)            nIncrem(xvec,(d),NULL,NULL)
+# define IT_X_INCREM01(d,a)        nIncrem01(xvec,(d),(a),NULL,NULL)
+# define IT_X_INCREM01_CMPLX(d,a)  nIncrem01_cmplx(xvec,(d),(a),NULL,NULL)
+# define IT_X_INCREM011_CMPLX(d1,d2,a1,a2) nIncrem011_cmplx(xvec,(d1),(d2),(a1),(a2))
 #endif
 
-#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
+/* Right-preconditioned BCGS2 helpers.  r and all recurrence vectors remain in
+ * the physical residual space.  Only operator inputs and solution increments
+ * are mapped through M^-1.  Therefore xvec remains the physical ADDA solution,
+ * so checkpoints and true-residual recomputation keep their original meaning. */
+static void BCGS2Operator(doublecomplex * restrict in,doublecomplex * restrict out,double *inprod,
+                          TIME_TYPE *timing,TIME_TYPE *comm_timing)
+{
+    IT_MATVEC(in,out,inprod,false,timing,comm_timing);
+}
+
+static void BCGS2UpdateX(const doublecomplex * restrict direction,const itercomplex alpha)
+{
+    IT_X_INCREM01_CMPLX(direction,alpha);
+}
+
+#ifdef ADDA_CUDA
 #define RELIABLE_GAP_TOL 1E-3
+#define RECALC_RELIABLE_GAP_TOL 1E-2
+#define RECALC_RELIABLE_PERIOD 20
+#define LANIER_RELIABLE_GAP_TOL 1E-2
+#define LANIER_RELIABLE_PERIOD 20
+#define LANIER_RESET_RATIO 100.0
 
 typedef struct
 {
-	double true_norm2;
+	double physical_true_norm2;
+	double recurrence_true_norm2;
 	double gap_norm2;
 	double gap;
+	double physical_rel;
 	bool restart;
 	bool forced_restart;
 	bool true_converged;
 	bool false_convergence;
 } reliable_residual_result;
 
-static reliable_residual_result ReliableResidualCheck(const enum iter method,const double recursive_norm2)
-/* Non-destructive reliable-residual check for CUDA float32 BiCGStab(2)/BCGS2
- * and GPBiCGStab(2).
- *
- *  1. Compute Ax into the already resident Avecbuffer.
- *  2. Download Ax and the current recursive residual r.
- *  3. In FP64 arithmetic form, element by element,
- *         r_true = sqrt(C) Einc - Ax
- *     and the vector residual gap
- *         ||r_true-r_recursive|| / ||r_true||.
- *  4. If the gap is small, leave every GPU Krylov vector untouched and continue.
- *  5. Restart only when the vector gap exceeds RELIABLE_GAP_TOL, when
- *     recursive convergence is not confirmed by the true residual, or when
- *     -reliable_resid_force_restart is active.
- *
- * The forced-restart option is deliberately a validation tool. It still avoids
- * restarting when r_true already satisfies the stopping criterion.
- *
- * No additional resident GPU vector and no additional full-size host vector is
- * needed. Avecbuffer contains Ax on the host, while rvec contains the downloaded
- * recursive residual. If a restart is required, rvec is overwritten by r_true
- * in a second pass and uploaded. */
+static const char *LanierMethodName(const enum iter method)
 {
-	reliable_residual_result result={0,0,0,false,false,false,false};
+	switch (method) {
+		case IT_BCGS2: return "BCGS2";
+		case IT_BICG_CS: return "BiCG-CS";
+		case IT_BICGSTAB: return "BiCGStab";
+		case IT_BICGSTAB4: return "BiCGStab(4)";
+		case IT_BICGSTAB8: return "BiCGStab(8)";
+		case IT_BICGSTAB12: return "BiCGStab(12)";
+		case IT_CGNR: return "CGNR";
+		case IT_CSYM: return "CSYM";
+		case IT_GPBICGSTAB2: return "GPBiCGStab(2)";
+		case IT_GPBICGSTAB4: return "GPBiCGStab(4)";
+		case IT_QMR_CS: return "QMR-CS";
+		case IT_QMR_CS_2: return "QMR2-CS";
+		default: return "unknown";
+	}
+}
+
+static double PhysicalRHSNorm2(void)
+/* ||sqrt(C) Einc||^2 evaluated in double accumulation. This remains the
+ * physical normalization even when a complex-symmetric solver works on P*A*P. */
+{
 	TIME_TYPE host_comm=0;
 	register size_t i,k;
-	double true_sum=0,gap_sum=0;
+	double sum=0;
+	LARGE_LOOP;
+	for (i=0,k=0;i<local_nvoid_Ndip;i++,k+=3) {
+		const doublecomplex * restrict val=cc_sqrt[material[i]];
+		int j;
+		for (j=0;j<3;j++) {
+			const double complex b=(double complex)val[j]*(double complex)Einc[k+j];
+			sum+=creal(b)*creal(b)+cimag(b)*cimag(b);
+		}
+	}
+	MyInnerProduct(&sum,double_type,1,&host_comm);
+	Timing_InitIterComm+=host_comm;
+	return sum;
+}
 
-	IT_MATVEC(xvec,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+static reliable_residual_result ReliableResidualCheck(const enum iter method,const double recursive_norm2,
+	const double gap_threshold,const bool force_restart)
+/* Independently recompute the physical residual r_true=b-A*x.
+ *
+ * For normal right-preconditioned solvers, the Krylov residual and physical
+ * residual live in the same space. For complex-symmetric congruence solvers,
+ * the Krylov recurrence lives in P*r, so the independently recomputed physical
+ * residual is additionally mapped through P before evaluating the vector gap.
+ * Convergence itself is always checked with the physical residual.
+ *
+ * lanier_recursive_residual_vec normally points to rvec. CSYM, which does not
+ * explicitly retain r_k, reconstructs r_k=tau*conj(q_{k+1}) in Avecbuffer at
+ * the end of each iteration and publishes that vector through this pointer. */
+{
+	reliable_residual_result result={0,0,0,0,0,false,false,false,false};
+	TIME_TYPE host_comm=0;
+	register size_t i,k;
+	double true_sum=0,gap_sum=0,rec_true_sum=0;
+	doublecomplex *rec_host;
+	doublecomplex *rec_vec=(lanier_recursive_residual_vec ? lanier_recursive_residual_vec : rvec);
+
+	rec_host=(doublecomplex *)malloc(local_nRows*sizeof(doublecomplex));
+	if (rec_host==NULL) LogError(ALL_POS,"Failed allocating temporary reliable-residual host vector");
+	CudaIterDownloadOne(rec_vec);
+	memcpy(rec_host,rec_vec,local_nRows*sizeof(doublecomplex));
+
+	/* Physical A*x, never the preconditioned operator. xvec is kept physical by
+	 * the LANIER_FULL integration. */
+	MatVec_GPU(xvec,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 	CudaIterDownloadOne(Avecbuffer);
-	CudaIterDownloadOne(rvec);
 
-	/* Promote all operands before forming the true residual and the gap. This
-	 * does not make the MatVec itself FP64, but avoids adding another FP32
-	 * accumulation error to the diagnostic. */
+	/* Form the physical true residual in the host backing of Avecbuffer. */
 	LARGE_LOOP;
 	for (i=0,k=0;i<local_nvoid_Ndip;i++,k+=3) {
 		const doublecomplex * restrict val=cc_sqrt[material[i]];
@@ -573,53 +732,79 @@ static reliable_residual_result ReliableResidualCheck(const enum iter method,con
 			const double complex b=(double complex)val[j]*(double complex)Einc[k+j];
 			const double complex ax=(double complex)Avecbuffer[k+j];
 			const double complex rt=b-ax;
-			const double complex rr=(double complex)rvec[k+j];
-			const double complex dg=rt-rr;
+			Avecbuffer[k+j]=(doublecomplex)rt;
 			true_sum+=creal(rt)*creal(rt)+cimag(rt)*cimag(rt);
-			gap_sum+=creal(dg)*creal(dg)+cimag(dg)*cimag(dg);
 		}
 	}
 	MyInnerProduct(&true_sum,double_type,1,&host_comm);
+	Timing_OneIterComm+=host_comm;
+	result.physical_true_norm2=true_sum;
+	result.physical_rel=(lanier_physical_rhs_norm2>0 ? sqrt(MAX(0.0,true_sum/lanier_physical_rhs_norm2)) : HUGE_VAL);
+	result.true_converged=(lanier_physical_rhs_norm2>0 && true_sum<=iter_eps*iter_eps*lanier_physical_rhs_norm2);
+
+	/* Convert r_true to the residual space of the recurrence when necessary. */
+	if (lanier_cs_congruence) {
+		CudaIterUploadOne(Avecbuffer);
+		CudaLanierApply(Avecbuffer,Avecbuffer);
+		CudaIterDownloadOne(Avecbuffer);
+		LARGE_LOOP;
+		for (i=0;i<local_nRows;i++) {
+			const double complex z=(double complex)Avecbuffer[i];
+			rec_true_sum+=creal(z)*creal(z)+cimag(z)*cimag(z);
+		}
+		host_comm=0;
+		MyInnerProduct(&rec_true_sum,double_type,1,&host_comm);
+		Timing_OneIterComm+=host_comm;
+		result.recurrence_true_norm2=rec_true_sum;
+	}
+	else result.recurrence_true_norm2=true_sum;
+
+	/* Vector residual gap in the actual recurrence space. */
+	LARGE_LOOP;
+	for (i=0;i<local_nRows;i++) {
+		const double complex rt=(double complex)Avecbuffer[i];
+		const double complex rr=(double complex)rec_host[i];
+		const double complex dg=rt-rr;
+		gap_sum+=creal(dg)*creal(dg)+cimag(dg)*cimag(dg);
+	}
+	free(rec_host);
+	host_comm=0;
 	MyInnerProduct(&gap_sum,double_type,1,&host_comm);
 	Timing_OneIterComm+=host_comm;
-	result.true_norm2=true_sum;
 	result.gap_norm2=gap_sum;
-	result.gap=(true_sum>0 ? sqrt(MAX(0.0,gap_sum/true_sum)) : (gap_sum>0 ? HUGE_VAL : 0));
-	result.true_converged=(true_sum<=epsB);
+	result.gap=(result.recurrence_true_norm2>0 ?
+		sqrt(MAX(0.0,gap_sum/result.recurrence_true_norm2)) : (gap_sum>0 ? HUGE_VAL : 0));
 	result.false_convergence=(recursive_norm2<=epsB && !result.true_converged);
-	result.forced_restart=(reliable_resid_force_restart && !result.true_converged);
+	result.forced_restart=(force_restart && !result.true_converged);
 	result.restart=(!result.true_converged &&
-		(result.forced_restart || result.gap>=RELIABLE_GAP_TOL || result.false_convergence));
+		(result.forced_restart || result.gap>=gap_threshold || result.false_convergence));
 
 	if (result.restart) {
-		/* Re-form r_true into the already allocated host rvec, upload only that
-		 * vector, retain x, and rebuild the selected L=2 Krylov recurrence. */
-		LARGE_LOOP;
-		for (i=0,k=0;i<local_nvoid_Ndip;i++,k+=3) {
-			const doublecomplex * restrict val=cc_sqrt[material[i]];
-			int j;
-			for (j=0;j<3;j++) {
-				const double complex b=(double complex)val[j]*(double complex)Einc[k+j];
-				const double complex ax=(double complex)Avecbuffer[k+j];
-				rvec[k+j]=(doublecomplex)(b-ax);
-			}
-		}
+		/* Avecbuffer contains r_true in recurrence space (physical r_true for A*P,
+		 * P*r_true for P*A*P). Materialize it as the new recursive residual. */
+		memcpy(rvec,Avecbuffer,local_nRows*sizeof(doublecomplex));
 		CudaIterUploadOne(rvec);
 		matvec_ready=false;
-		if (method==IT_GPBICGSTAB2) {
-			gp2_restart_request=true;
-			GPBiCGStab2(PHASE_INIT);
-			gp2_restart_request=false;
-		}
-		else if (method==IT_BCGS2) {
-			bcgs2_restart_request=true;
-			BCGS2(PHASE_INIT);
-			bcgs2_restart_request=false;
-		}
-		else LogError(ONE_POS,"Reliable residual restart requested for unsupported iterative solver");
 	}
-
 	return result;
+}
+
+static void RestartKrylovFromTrueResidual(const enum iter method,const double recurrence_norm2)
+/* Rebuild only recurrence/history state. Keep xvec (the physical solution).
+ * The independently recomputed residual has already been uploaded to rvec. */
+{
+	inprodR=recurrence_norm2;
+	inprodRp1=recurrence_norm2;
+	counter=0;
+	complete=true;
+	matvec_ready=false;
+	lanier_hard_restart_request=true;
+	if (method==IT_BCGS2) bcgs2_restart_request=true;
+	if (method==IT_GPBICGSTAB2) gp2_restart_request=true;
+	(*params[ind_m].func)(PHASE_INIT);
+	bcgs2_restart_request=false;
+	gp2_restart_request=false;
+	lanier_hard_restart_request=false;
 }
 #endif
 
@@ -706,9 +891,9 @@ ITER_FUNC(BCGS2)
 					for (i=0;i<=j;i++) IT_INCREM10_CMPLX(u[i],r[i],temp1,NULL,NULL);
 				}
 				rho0=rho1;
-				// u_j+1 = A.u_j
-				if (niter==1 && j==0 && matvec_ready) {} // do nothing; u[1]<=>Avecbuffer already contains matvec result
-				else IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+				// u_j+1 = (A*M^-1).u_j when Lanier right preconditioning is active
+				if (niter==1 && j==0 && matvec_ready && !lanier_precon) {} // cached vector contains physical A*r0 only
+				else BCGS2Operator(u[j],u[j+1],NULL,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 				sigma=IT_DOT(u[j+1],pvec,&Timing_OneIterComm); // sigma = u_j+1.r~0
 				// test for zero sigma (1/alpha)
 				dtmp=cabs(sigma)/cabs(rho1); // assume that rho1 is not exactly zero
@@ -716,11 +901,11 @@ ITER_FUNC(BCGS2)
 				if (dtmp<EPS1)
 					LogError(ONE_POS,"BCGS2 fails: |u_%d.r~|/|r_%d.r~| is too small ("GFORM_DEBUG").",j+1,j,dtmp);
 				alpha = rho1/sigma;
-				IT_INCREM01_CMPLX(xvec,u[0],alpha,NULL,NULL); // x = x + alpha*u_0
+				BCGS2UpdateX(u[0],alpha); // x = x + alpha*M^-1*u_0 for right preconditioning
 				// r_i = r_i - alpha*u_i+1
 				temp1=-alpha;
 				for (i=0;i<=j;i++) IT_INCREM01_CMPLX(r[i],u[i+1],temp1,NULL,NULL);
-				IT_MATVEC(r[j],r[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+				BCGS2Operator(r[j],r[j+1],NULL,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			}
 			// --- The convex polynomial part ---
 			// Z = R'R
@@ -766,7 +951,7 @@ ITER_FUNC(BCGS2)
 			for (i=1;i<=LL;i++) {
 				temp1=-y0[i];
 				IT_INCREM01_CMPLX(u[0],u[i],temp1,NULL,NULL);   // u_0 = u_0 - y0[i]*u_i
-				IT_INCREM01_CMPLX(xvec,r[i-1],y0[i],NULL,NULL); // x = x + y0[i]*r_i-1
+				BCGS2UpdateX(r[i-1],y0[i]); // x = x + y0[i]*M^-1*r_i-1
 				IT_INCREM01_CMPLX(r[0],r[i],temp1,NULL,NULL);   // r_0 = r_0 - y0[i]*r_i
 			}
 			// y0 has changed; compute Zy0 once more
@@ -822,6 +1007,29 @@ static bool GPSolveSmallN(double complex *a,double complex *b,const int n,const 
 	}
 #undef GP_A
 	return true;
+}
+
+static int GPSolveSmallNAdaptive(const double complex *a_src,const double complex *b_src,
+	double complex *a_work,double complex *b_work,const int n,const int ld)
+/* Rank-adaptive wrapper for the tiny MR normal equations used by L=4 methods.
+ * A Krylov basis may become exactly/nearly rank deficient on an easy regional
+ * LANIER_PARTITION subproblem. That is a happy/near breakdown, not a reason
+ * to abort the whole run. Try the full degree first, then truncate the MR
+ * polynomial to the largest nonsingular leading subspace. */
+{
+	int i,j,k;
+	for (k=n;k>=1;k--) {
+		for (i=0;i<n;i++) {
+			b_work[i]=0;
+			for (j=0;j<ld;j++) a_work[i*ld+j]=0;
+		}
+		for (i=0;i<k;i++) {
+			b_work[i]=b_src[i];
+			for (j=0;j<k;j++) a_work[i*ld+j]=a_src[i*ld+j];
+		}
+		if (GPSolveSmallN(a_work,b_work,k,ld)) return k;
+	}
+	return 0;
 }
 
 static double complex GPDot(const doublecomplex * restrict a,const doublecomplex * restrict b,TIME_TYPE *comm)
@@ -907,7 +1115,7 @@ ITER_FUNC(BiCGStab4)
 	double complex rho1,beta,den,temp;
 	double complex tau[BSL4_L][BSL4_L],gamma_p[BSL4_L+1],gamma[BSL4_L+1],gamma_pp[BSL4_L+1];
 	double sigma[BSL4_L+1];
-	int i,j;
+	int i,j,mr_rank;
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -921,7 +1129,7 @@ ITER_FUNC(BiCGStab4)
 			return;
 
 		case PHASE_INIT:
-			if (!load_chpoint) {
+			if (!load_chpoint || lanier_hard_restart_request) {
 				double nrm;
 				IT_COPY(rtilda,rvec);
 				nrm=sqrt(MAX(0.0,creal(GPDot(rtilda,rtilda,&Timing_InitIterComm))));
@@ -954,13 +1162,14 @@ ITER_FUNC(BiCGStab4)
 				temp=-alpha;
 				for (i=0;i<=j;i++) IT_INCREM01_CMPLX(r[i],u[i+1],temp,NULL,NULL);
 				IT_MATVEC(r[j],r[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
-				IT_INCREM01_CMPLX(xvec,u[0],alpha,NULL,NULL);
+				IT_X_INCREM01_CMPLX(u[0],alpha);
 			}
 
 			memset(tau,0,sizeof(tau));
 			memset(gamma_p,0,sizeof(gamma_p));
 			memset(gamma,0,sizeof(gamma));
 			memset(gamma_pp,0,sizeof(gamma_pp));
+			mr_rank=BSL4_L;
 			for (j=1;j<=BSL4_L;j++) {
 				for (i=1;i<j;i++) {
 					tau[j-1][i-1]=GPDot(r[i],r[j],&Timing_OneIterComm)/sigma[i];
@@ -968,23 +1177,36 @@ ITER_FUNC(BiCGStab4)
 					IT_INCREM01_CMPLX(r[j],r[i],temp,NULL,NULL);
 				}
 				sigma[j]=creal(GPDot(r[j],r[j],&Timing_OneIterComm));
-				if (!(sigma[j]>BSL4_EPS)) LogError(ONE_POS,"BiCGStab(4) breakdown in MR polynomial at r_%d",j);
+				if (!(sigma[j]>BSL4_EPS)) { mr_rank=j-1; break; }
 				gamma_p[j]=GPDot(r[j],r[0],&Timing_OneIterComm)/sigma[j];
 			}
-			omega=gamma[BSL4_L]=gamma_p[BSL4_L];
-			for (j=BSL4_L-1;j>=1;j--) {
+			if (mr_rank<BSL4_L && IFROOT)
+				PrintBoth(logfile,"BiCGStab(4) MR happy/near breakdown: using degree %d instead of 4 at iteration %d.\n",mr_rank,niter);
+			if (mr_rank==0) {
+				/* No usable MR direction remains. Keep the valid BiCG update already
+				 * accumulated in x/r0 and restart the L=4 recurrence next iteration. */
+				inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+				if (inprodRp1>BSL4_EPS) {
+					double nrm=sqrt(inprodRp1);
+					IT_COPY(rtilda,r[0]); IT_MULT_SELF(rtilda,1.0/nrm);
+					IT_MULT_CMPLX(u[0],r[0],0); rho=1; alpha=0; omega=1;
+				}
+				return;
+			}
+			omega=gamma[mr_rank]=gamma_p[mr_rank];
+			for (j=mr_rank-1;j>=1;j--) {
 				gamma[j]=gamma_p[j];
-				for (i=j+1;i<=BSL4_L;i++) gamma[j]-=tau[i-1][j-1]*gamma[i];
+				for (i=j+1;i<=mr_rank;i++) gamma[j]-=tau[i-1][j-1]*gamma[i];
 			}
-			for (j=1;j<BSL4_L;j++) {
+			for (j=1;j<mr_rank;j++) {
 				gamma_pp[j]=gamma[j+1];
-				for (i=j+1;i<BSL4_L;i++) gamma_pp[j]+=tau[i-1][j-1]*gamma[i+1];
+				for (i=j+1;i<mr_rank;i++) gamma_pp[j]+=tau[i-1][j-1]*gamma[i+1];
 			}
-			IT_INCREM01_CMPLX(xvec,r[0],gamma[1],NULL,NULL);
-			temp=-gamma_p[BSL4_L]; IT_INCREM01_CMPLX(r[0],r[BSL4_L],temp,NULL,NULL);
-			temp=-gamma[BSL4_L]; IT_INCREM01_CMPLX(u[0],u[BSL4_L],temp,NULL,NULL);
-			for (j=1;j<BSL4_L;j++) {
-				IT_INCREM01_CMPLX(xvec,r[j],gamma_pp[j],NULL,NULL);
+			IT_X_INCREM01_CMPLX(r[0],gamma[1]);
+			temp=-gamma_p[mr_rank]; IT_INCREM01_CMPLX(r[0],r[mr_rank],temp,NULL,NULL);
+			temp=-gamma[mr_rank]; IT_INCREM01_CMPLX(u[0],u[mr_rank],temp,NULL,NULL);
+			for (j=1;j<mr_rank;j++) {
+				IT_X_INCREM01_CMPLX(r[j],gamma_pp[j]);
 				temp=-gamma_p[j]; IT_INCREM01_CMPLX(r[0],r[j],temp,NULL,NULL);
 				temp=-gamma[j]; IT_INCREM01_CMPLX(u[0],u[j],temp,NULL,NULL);
 			}
@@ -994,6 +1216,248 @@ ITER_FUNC(BiCGStab4)
 	LogError(ONE_POS,"Unknown phase (%d) of BiCGStab(4)",(int)ph);
 #undef BSL4_L
 #undef BSL4_EPS
+}
+
+ITER_FUNC(BiCGStab8)
+/* BiCGStab(L), L=8, CPU implementation.  The BiCG part follows the
+ * Sleijpen/Fokkema BiCGStab(L) recurrence and the MR polynomial is formed by
+ * modified Gram-Schmidt.  The large vectors stay in the native ADDA precision;
+ * GPDot() promotes/accumulates scalar products in FP64 in adda_single.
+ *
+ * Workspace: the common rvec/u0=pvec plus 17 extra vectors:
+ *   r~0, r1..r8, u1..u8.  Thus the complete method uses the theoretical
+ *   2L+3=19 Krylov vectors including r0 and u0, without any double MatVec. */
+{
+#define BSL8_L 8
+#define BSL8_EPS 1E-30
+	static doublecomplex *r[BSL8_L+1],*u[BSL8_L+1],*rtilda;
+	static double complex rho,alpha,omega;
+	doublecomplex *base;
+	double complex rho1,beta,den,temp;
+	double complex tau[BSL8_L][BSL8_L],gamma_p[BSL8_L+1],gamma[BSL8_L+1],gamma_pp[BSL8_L+1];
+	double sigma[BSL8_L+1];
+	int i,j,mr_rank;
+
+	switch (ph) {
+		case PHASE_VARS:
+			base=EnsureCPUL4Workspace(17,"BiCGStab(8) L=8 workspace");
+			r[0]=rvec; u[0]=pvec; rtilda=base;
+			for (i=1;i<=BSL8_L;i++) r[i]=base+(size_t)i*local_nRows;
+			for (i=1;i<=BSL8_L;i++) u[i]=base+(size_t)(BSL8_L+i)*local_nRows;
+			for (i=0;i<17;i++) { vectors[i].ptr=base+(size_t)i*local_nRows; vectors[i].size=sizeof(doublecomplex); }
+			scalars[0].ptr=&rho; scalars[1].ptr=&alpha; scalars[2].ptr=&omega;
+			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(double complex);
+			return;
+
+		case PHASE_INIT:
+			if (!load_chpoint || lanier_hard_restart_request) {
+				double nrm;
+				IT_COPY(rtilda,rvec);
+				nrm=sqrt(MAX(0.0,creal(GPDot(rtilda,rtilda,&Timing_InitIterComm))));
+				if (nrm<BSL8_EPS) LogError(ONE_POS,"BiCGStab(8) cannot start from a zero residual");
+				IT_MULT_SELF(rtilda,1.0/nrm);
+				IT_MULT_CMPLX(u[0],rvec,0);
+				rho=1; alpha=0; omega=1;
+			}
+			return;
+
+		case PHASE_ITER:
+			rho=-omega*rho;
+			for (j=0;j<BSL8_L;j++) {
+				if (cabs(rho)<BSL8_EPS) LogError(ONE_POS,"BiCGStab(8) breakdown: rho is zero");
+				rho1=GPDot(rtilda,r[j],&Timing_OneIterComm);
+				beta=alpha*rho1/rho;
+				rho=rho1;
+				temp=-beta;
+				for (i=0;i<=j;i++) IT_INCREM10_CMPLX(u[i],r[i],temp,NULL,NULL); /* u_i=r_i-beta*u_i */
+#ifdef ADDA_CUDA
+				/* Save one full CUDA vector: do not register Avecbuffer for this solver. */
+				IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#else
+				if (niter==1 && j==0 && matvec_ready) IT_COPY(u[1],Avecbuffer);
+				else IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#endif
+				den=GPDot(rtilda,u[j+1],&Timing_OneIterComm);
+				if (cabs(den)<BSL8_EPS) LogError(ONE_POS,"BiCGStab(8) breakdown: <r~,u_%d> is zero",j+1);
+				alpha=rho/den;
+				temp=-alpha;
+				for (i=0;i<=j;i++) IT_INCREM01_CMPLX(r[i],u[i+1],temp,NULL,NULL);
+				IT_MATVEC(r[j],r[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+				IT_X_INCREM01_CMPLX(u[0],alpha);
+			}
+
+			memset(tau,0,sizeof(tau));
+			memset(gamma_p,0,sizeof(gamma_p));
+			memset(gamma,0,sizeof(gamma));
+			memset(gamma_pp,0,sizeof(gamma_pp));
+			mr_rank=BSL8_L;
+			for (j=1;j<=BSL8_L;j++) {
+				for (i=1;i<j;i++) {
+					tau[j-1][i-1]=GPDot(r[i],r[j],&Timing_OneIterComm)/sigma[i];
+					temp=-tau[j-1][i-1];
+					IT_INCREM01_CMPLX(r[j],r[i],temp,NULL,NULL);
+				}
+				sigma[j]=creal(GPDot(r[j],r[j],&Timing_OneIterComm));
+				if (!(sigma[j]>BSL8_EPS)) { mr_rank=j-1; break; }
+				gamma_p[j]=GPDot(r[j],r[0],&Timing_OneIterComm)/sigma[j];
+			}
+			if (mr_rank<BSL8_L && IFROOT)
+				PrintBoth(logfile,"BiCGStab(8) MR happy/near breakdown: using degree %d instead of 8 at iteration %d.\n",mr_rank,niter);
+			if (mr_rank==0) {
+				/* No usable MR direction remains. Keep the valid BiCG update already
+				 * accumulated in x/r0 and restart the L=8 recurrence next iteration. */
+				inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+				if (inprodRp1>BSL8_EPS) {
+					double nrm=sqrt(inprodRp1);
+					IT_COPY(rtilda,r[0]); IT_MULT_SELF(rtilda,1.0/nrm);
+					IT_MULT_CMPLX(u[0],r[0],0); rho=1; alpha=0; omega=1;
+				}
+				return;
+			}
+			omega=gamma[mr_rank]=gamma_p[mr_rank];
+			for (j=mr_rank-1;j>=1;j--) {
+				gamma[j]=gamma_p[j];
+				for (i=j+1;i<=mr_rank;i++) gamma[j]-=tau[i-1][j-1]*gamma[i];
+			}
+			for (j=1;j<mr_rank;j++) {
+				gamma_pp[j]=gamma[j+1];
+				for (i=j+1;i<mr_rank;i++) gamma_pp[j]+=tau[i-1][j-1]*gamma[i+1];
+			}
+			IT_X_INCREM01_CMPLX(r[0],gamma[1]);
+			temp=-gamma_p[mr_rank]; IT_INCREM01_CMPLX(r[0],r[mr_rank],temp,NULL,NULL);
+			temp=-gamma[mr_rank]; IT_INCREM01_CMPLX(u[0],u[mr_rank],temp,NULL,NULL);
+			for (j=1;j<mr_rank;j++) {
+				IT_X_INCREM01_CMPLX(r[j],gamma_pp[j]);
+				temp=-gamma_p[j]; IT_INCREM01_CMPLX(r[0],r[j],temp,NULL,NULL);
+				temp=-gamma[j]; IT_INCREM01_CMPLX(u[0],u[j],temp,NULL,NULL);
+			}
+			inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+			return;
+	}
+	LogError(ONE_POS,"Unknown phase (%d) of BiCGStab(8)",(int)ph);
+#undef BSL8_L
+#undef BSL8_EPS
+}
+
+ITER_FUNC(BiCGStab12)
+/* BiCGStab(L), L=12, CPU implementation.  The BiCG part follows the
+ * Sleijpen/Fokkema BiCGStab(L) recurrence and the MR polynomial is formed by
+ * modified Gram-Schmidt.  The large vectors stay in the native ADDA precision;
+ * GPDot() promotes/accumulates scalar products in FP64 in adda_single.
+ *
+ * Workspace: the common rvec/u0=pvec plus 25 extra vectors:
+ *   r~0, r1..r12, u1..u12.  Thus the complete method uses the theoretical
+ *   2L+3=27 Krylov vectors including r0 and u0, without any double MatVec. */
+{
+#define BSL12_L 12
+#define BSL12_EPS 1E-30
+	static doublecomplex *r[BSL12_L+1],*u[BSL12_L+1],*rtilda;
+	static double complex rho,alpha,omega;
+	doublecomplex *base;
+	double complex rho1,beta,den,temp;
+	double complex tau[BSL12_L][BSL12_L],gamma_p[BSL12_L+1],gamma[BSL12_L+1],gamma_pp[BSL12_L+1];
+	double sigma[BSL12_L+1];
+	int i,j,mr_rank;
+
+	switch (ph) {
+		case PHASE_VARS:
+			base=EnsureCPUL4Workspace(25,"BiCGStab(12) L=12 workspace");
+			r[0]=rvec; u[0]=pvec; rtilda=base;
+			for (i=1;i<=BSL12_L;i++) r[i]=base+(size_t)i*local_nRows;
+			for (i=1;i<=BSL12_L;i++) u[i]=base+(size_t)(BSL12_L+i)*local_nRows;
+			for (i=0;i<25;i++) { vectors[i].ptr=base+(size_t)i*local_nRows; vectors[i].size=sizeof(doublecomplex); }
+			scalars[0].ptr=&rho; scalars[1].ptr=&alpha; scalars[2].ptr=&omega;
+			scalars[0].size=scalars[1].size=scalars[2].size=sizeof(double complex);
+			return;
+
+		case PHASE_INIT:
+			if (!load_chpoint || lanier_hard_restart_request) {
+				double nrm;
+				IT_COPY(rtilda,rvec);
+				nrm=sqrt(MAX(0.0,creal(GPDot(rtilda,rtilda,&Timing_InitIterComm))));
+				if (nrm<BSL12_EPS) LogError(ONE_POS,"BiCGStab(12) cannot start from a zero residual");
+				IT_MULT_SELF(rtilda,1.0/nrm);
+				IT_MULT_CMPLX(u[0],rvec,0);
+				rho=1; alpha=0; omega=1;
+			}
+			return;
+
+		case PHASE_ITER:
+			rho=-omega*rho;
+			for (j=0;j<BSL12_L;j++) {
+				if (cabs(rho)<BSL12_EPS) LogError(ONE_POS,"BiCGStab(12) breakdown: rho is zero");
+				rho1=GPDot(rtilda,r[j],&Timing_OneIterComm);
+				beta=alpha*rho1/rho;
+				rho=rho1;
+				temp=-beta;
+				for (i=0;i<=j;i++) IT_INCREM10_CMPLX(u[i],r[i],temp,NULL,NULL); /* u_i=r_i-beta*u_i */
+#ifdef ADDA_CUDA
+				/* Save one full CUDA vector: do not register Avecbuffer for this solver. */
+				IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#else
+				if (niter==1 && j==0 && matvec_ready) IT_COPY(u[1],Avecbuffer);
+				else IT_MATVEC(u[j],u[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+#endif
+				den=GPDot(rtilda,u[j+1],&Timing_OneIterComm);
+				if (cabs(den)<BSL12_EPS) LogError(ONE_POS,"BiCGStab(12) breakdown: <r~,u_%d> is zero",j+1);
+				alpha=rho/den;
+				temp=-alpha;
+				for (i=0;i<=j;i++) IT_INCREM01_CMPLX(r[i],u[i+1],temp,NULL,NULL);
+				IT_MATVEC(r[j],r[j+1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+				IT_X_INCREM01_CMPLX(u[0],alpha);
+			}
+
+			memset(tau,0,sizeof(tau));
+			memset(gamma_p,0,sizeof(gamma_p));
+			memset(gamma,0,sizeof(gamma));
+			memset(gamma_pp,0,sizeof(gamma_pp));
+			mr_rank=BSL12_L;
+			for (j=1;j<=BSL12_L;j++) {
+				for (i=1;i<j;i++) {
+					tau[j-1][i-1]=GPDot(r[i],r[j],&Timing_OneIterComm)/sigma[i];
+					temp=-tau[j-1][i-1];
+					IT_INCREM01_CMPLX(r[j],r[i],temp,NULL,NULL);
+				}
+				sigma[j]=creal(GPDot(r[j],r[j],&Timing_OneIterComm));
+				if (!(sigma[j]>BSL12_EPS)) { mr_rank=j-1; break; }
+				gamma_p[j]=GPDot(r[j],r[0],&Timing_OneIterComm)/sigma[j];
+			}
+			if (mr_rank<BSL12_L && IFROOT)
+				PrintBoth(logfile,"BiCGStab(12) MR happy/near breakdown: using degree %d instead of 12 at iteration %d.\n",mr_rank,niter);
+			if (mr_rank==0) {
+				/* No usable MR direction remains. Keep the valid BiCG update already
+				 * accumulated in x/r0 and restart the L=12 recurrence next iteration. */
+				inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+				if (inprodRp1>BSL12_EPS) {
+					double nrm=sqrt(inprodRp1);
+					IT_COPY(rtilda,r[0]); IT_MULT_SELF(rtilda,1.0/nrm);
+					IT_MULT_CMPLX(u[0],r[0],0); rho=1; alpha=0; omega=1;
+				}
+				return;
+			}
+			omega=gamma[mr_rank]=gamma_p[mr_rank];
+			for (j=mr_rank-1;j>=1;j--) {
+				gamma[j]=gamma_p[j];
+				for (i=j+1;i<=mr_rank;i++) gamma[j]-=tau[i-1][j-1]*gamma[i];
+			}
+			for (j=1;j<mr_rank;j++) {
+				gamma_pp[j]=gamma[j+1];
+				for (i=j+1;i<mr_rank;i++) gamma_pp[j]+=tau[i-1][j-1]*gamma[i+1];
+			}
+			IT_X_INCREM01_CMPLX(r[0],gamma[1]);
+			temp=-gamma_p[mr_rank]; IT_INCREM01_CMPLX(r[0],r[mr_rank],temp,NULL,NULL);
+			temp=-gamma[mr_rank]; IT_INCREM01_CMPLX(u[0],u[mr_rank],temp,NULL,NULL);
+			for (j=1;j<mr_rank;j++) {
+				IT_X_INCREM01_CMPLX(r[j],gamma_pp[j]);
+				temp=-gamma_p[j]; IT_INCREM01_CMPLX(r[0],r[j],temp,NULL,NULL);
+				temp=-gamma[j]; IT_INCREM01_CMPLX(u[0],u[j],temp,NULL,NULL);
+			}
+			inprodRp1=MAX(0.0,creal(GPDot(r[0],r[0],&Timing_OneIterComm)));
+			return;
+	}
+	LogError(ONE_POS,"Unknown phase (%d) of BiCGStab(12)",(int)ph);
+#undef BSL12_L
+#undef BSL12_EPS
 }
 
 //======================================================================================================================
@@ -1050,7 +1514,7 @@ ITER_FUNC(GPBiCGStab2)
 				sigma=GPDot(rtilda,work,&Timing_OneIterComm);
 				if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma1 is zero");
 				alpha=rho/sigma;
-				IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+				IT_X_INCREM01_CMPLX(pvec,alpha);
 				temp=-alpha; IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
 				IT_MATVEC(rvec,hs,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); /* r1 */
 				rho=GPDot(rtilda,hs,&Timing_OneIterComm);
@@ -1063,7 +1527,7 @@ ITER_FUNC(GPBiCGStab2)
 				sigma=GPDot(rtilda,hq1,&Timing_OneIterComm);
 				if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma2 is zero");
 				alpha=rho/sigma;
-				IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+				IT_X_INCREM01_CMPLX(pvec,alpha);
 				temp=-alpha;
 				IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
 				IT_INCREM01_CMPLX(hs,hq1,temp,NULL,NULL); /* r1 -= alpha*p2 */
@@ -1088,7 +1552,7 @@ ITER_FUNC(GPBiCGStab2)
 				/* z=zeta1*r0+zeta2*r1; x+=z.  Carry y/u directly as the
 				 * correction removed from r0/p0, eliminating r' and p' vectors. */
 				IT_LINCOMB_CMPLX(z,rvec,hs,zeta1,zeta2,NULL,NULL);
-				IT_INCREM(xvec,z,NULL,NULL);
+				IT_X_INCREM(z);
 				IT_LINCOMB_CMPLX(y,hs,hq0,zeta1,zeta2,NULL,NULL);
 				IT_LINCOMB_CMPLX(u,work,hq1,zeta1,zeta2,NULL,NULL);
 				IT_INCREM01_CMPLX(rvec,y,-1,NULL,NULL);
@@ -1109,7 +1573,7 @@ ITER_FUNC(GPBiCGStab2)
 			sigma=GPDot(rtilda,work,&Timing_OneIterComm);
 			if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma1 is zero");
 			alpha=rho/sigma;
-			IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+			IT_X_INCREM01_CMPLX(pvec,alpha);
 			temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); /* z-=alpha*u */
 			IT_INCREM011_CMPLX(y,hq0,work,-alpha,alpha);       /* y-=alpha*(q0-p1) */
 			IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
@@ -1129,7 +1593,7 @@ ITER_FUNC(GPBiCGStab2)
 			sigma=GPDot(rtilda,hs,&Timing_OneIterComm);
 			if (cabs(sigma)<GP_EPS) LogError(ONE_POS,"GPBiCGStab(2) breakdown: sigma2 is zero");
 			alpha=rho/sigma;
-			IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+			IT_X_INCREM01_CMPLX(pvec,alpha);
 			temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL);
 			IT_INCREM011_CMPLX(y,hq0,work,-alpha,alpha); /* y-=alpha*(q0-p1) */
 			/* q0 history is dead after the previous line and can become r2. */
@@ -1162,7 +1626,7 @@ ITER_FUNC(GPBiCGStab2)
 
 			/* z=eta*z+zeta1*r0+zeta2*r1; x+=z. */
 			IT_INCREM111_CMPLX(z,rvec,hq1,eta,zeta1,zeta2);
-			IT_INCREM(xvec,z,NULL,NULL);
+			IT_X_INCREM(z);
 			/* Carry the exact correction vectors into the next outer cycle:
 			 * y_next=eta*y+zeta1*r1+zeta2*r2,
 			 * u_next=eta*u+zeta1*p1+zeta2*p2. */
@@ -1202,10 +1666,12 @@ ITER_FUNC(GPBiCGStab4)
 #define GP4_EPS 1E-30
 	static doublecomplex *rtilda,*z,*y,*u,*hs[GP4_L-1],*hq[GP4_L],*work;
 	static double complex rho,sigma_c,alpha,beta,temp,zeta[GP4_L],eta;
+	static bool fresh_start;
 	doublecomplex *base;
 	doublecomplex *rr[GP4_L+1],*pp[GP4_L+1];
 	double complex mat[GP4_L+1][GP4_L+1],rhs[GP4_L+1];
-	int i,j;
+	double complex mat_work[GP4_L+1][GP4_L+1],rhs_work[GP4_L+1];
+	int i,j,mr_rank;
 
 #define GP4_BIND_POLY() do { \
 	rr[0]=rvec; rr[1]=hq[3]; rr[2]=hq[2]; rr[3]=hq[1]; rr[4]=hq[0]; \
@@ -1228,18 +1694,21 @@ ITER_FUNC(GPBiCGStab4)
 			for (i=0;i<11;i++) { vectors[i].ptr=base+(size_t)i*local_nRows; vectors[i].size=sizeof(doublecomplex); }
 			return;
 		case PHASE_INIT:
-			if (!load_chpoint) { IT_COPY(rtilda,rvec); IT_COPY(pvec,rvec); IT_MULT_CMPLX(z,rvec,0); }
+			if (!load_chpoint || lanier_hard_restart_request) {
+				IT_COPY(rtilda,rvec); IT_COPY(pvec,rvec); IT_MULT_CMPLX(z,rvec,0); fresh_start=true;
+			}
+			else fresh_start=false;
 			return;
 		case PHASE_ITER:
 			GP4_BIND_POLY();
-			if (niter==1) {
+			if (fresh_start) {
 				rho=GPDot(rtilda,rr[0],&Timing_OneIterComm);
 				for (j=1;j<=GP4_L;j++) {
 					if (j==1 && matvec_ready) { /* work==Avecbuffer is already ready */ }
 					else IT_MATVEC(pp[j-1],pp[j],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 					sigma_c=GPDot(rtilda,pp[j],&Timing_OneIterComm);
 					if (cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: initial sigma%d is zero",j);
-					alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pp[0],alpha,NULL,NULL); temp=-alpha;
+					alpha=rho/sigma_c; IT_X_INCREM01_CMPLX(pp[0],alpha); temp=-alpha;
 					for (i=0;i<j;i++) IT_INCREM01_CMPLX(rr[i],pp[i+1],temp,NULL,NULL);
 					IT_MATVEC(rr[j-1],rr[j],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 					rho=GPDot(rtilda,rr[j],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
@@ -1247,47 +1716,52 @@ ITER_FUNC(GPBiCGStab4)
 				}
 				memset(mat,0,sizeof(mat)); memset(rhs,0,sizeof(rhs));
 				for (i=0;i<GP4_L;i++) { for (j=0;j<GP4_L;j++) mat[i][j]=GPDot(rr[i+1],rr[j+1],&Timing_OneIterComm); rhs[i]=GPDot(rr[i+1],rr[0],&Timing_OneIterComm); }
-				if (!GPSolveSmallN(&mat[0][0],rhs,GP4_L,GP4_L+1)) LogError(ONE_POS,"GPBiCGStab(4) breakdown in initial 4x4 minimization");
-				for (i=0;i<GP4_L;i++) zeta[i]=rhs[i];
-				IT_MULT_CMPLX(z,rr[0],zeta[0]); for (i=1;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_INCREM(xvec,z,NULL,NULL);
+				mr_rank=GPSolveSmallNAdaptive(&mat[0][0],rhs,&mat_work[0][0],rhs_work,GP4_L,GP4_L+1);
+				if (mr_rank==0) LogError(ONE_POS,"GPBiCGStab(4) breakdown in initial MR minimization (rank 0)");
+				if (mr_rank<GP4_L && IFROOT)
+					PrintBoth(logfile,"GPBiCGStab(4) initial MR happy/near breakdown: using rank %d instead of 4 at iteration %d.\n",mr_rank,niter);
+				for (i=0;i<GP4_L;i++) zeta[i]=(i<mr_rank ? rhs_work[i] : 0);
+				IT_MULT_CMPLX(z,rr[0],zeta[0]); for (i=1;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_X_INCREM(z);
 				IT_MULT_CMPLX(y,rr[1],zeta[0]); IT_MULT_CMPLX(u,pp[1],zeta[0]);
 				for (i=1;i<GP4_L;i++) { IT_INCREM01_CMPLX(y,rr[i+1],zeta[i],NULL,NULL); IT_INCREM01_CMPLX(u,pp[i+1],zeta[i],NULL,NULL); }
 				IT_INCREM01_CMPLX(rr[0],y,-1,NULL,NULL); IT_INCREM01_CMPLX(pp[0],u,-1,NULL,NULL);
-				GP4_RESTORE_HISTORY(); inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm); return;
+				GP4_RESTORE_HISTORY(); inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm); fresh_start=false; return;
 			}
 
 			rho=GPDot(rtilda,rvec,&Timing_OneIterComm);
 			/* j=1 */
 			IT_MATVEC(pvec,work,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,work,&Timing_OneIterComm);
 			if (cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma1 is zero");
-			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
+			alpha=rho/sigma_c; IT_X_INCREM01_CMPLX(pvec,alpha); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL);
 			for (i=0;i<3;i++) IT_INCREM01_CMPLX(hs[i],hq[i+1],temp,NULL,NULL);
 			IT_MATVEC(rvec,hq[3],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[3],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
 			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); for(i=0;i<3;i++) IT_INCREM10_CMPLX(hq[i],hs[i],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
 			/* j=2 */
 			IT_MATVEC(work,hs[2],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[2],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma2 is zero");
-			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL);
+			alpha=rho/sigma_c; IT_X_INCREM01_CMPLX(pvec,alpha); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL);
 			for (i=0;i<2;i++) IT_INCREM01_CMPLX(hs[i],hq[i+1],temp,NULL,NULL);
 			IT_MATVEC(hq[3],hq[2],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			rho=GPDot(rtilda,hq[2],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta;
 			IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); for(i=0;i<2;i++) IT_INCREM10_CMPLX(hq[i],hs[i],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
 			/* j=3 */
 			IT_MATVEC(hs[2],hs[1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[1],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma3 is zero");
-			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hs[0],hq[1],temp,NULL,NULL);
+			alpha=rho/sigma_c; IT_X_INCREM01_CMPLX(pvec,alpha); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hs[0],hq[1],temp,NULL,NULL);
 			IT_MATVEC(hq[2],hq[1],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[1],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta; IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[1],hq[1],temp,NULL,NULL); IT_INCREM10_CMPLX(hq[0],hs[0],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
 			/* j=4 */
 			IT_MATVEC(hs[1],hs[0],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); sigma_c=GPDot(rtilda,hs[0],&Timing_OneIterComm); if(cabs(sigma_c)<GP4_EPS) LogError(ONE_POS,"GPBiCGStab(4) breakdown: sigma4 is zero");
-			alpha=rho/sigma_c; IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[1],hs[0],temp,NULL,NULL);
+			alpha=rho/sigma_c; IT_X_INCREM01_CMPLX(pvec,alpha); temp=-alpha; IT_INCREM01_CMPLX(z,u,temp,NULL,NULL); IT_INCREM011_CMPLX(y,hq[0],work,-alpha,alpha); IT_INCREM01_CMPLX(rvec,work,temp,NULL,NULL); IT_INCREM01_CMPLX(hq[3],hs[2],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[2],hs[1],temp,NULL,NULL); IT_INCREM01_CMPLX(hq[1],hs[0],temp,NULL,NULL);
 			IT_MATVEC(hq[1],hq[0],NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm); rho=GPDot(rtilda,hq[0],&Timing_OneIterComm); beta=rho/sigma_c; temp=-beta; IT_INCREM10_CMPLX(pvec,rvec,temp,NULL,NULL); IT_INCREM10_CMPLX(work,hq[3],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[2],hq[2],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[1],hq[1],temp,NULL,NULL); IT_INCREM10_CMPLX(hs[0],hq[0],temp,NULL,NULL); IT_INCREM10_CMPLX(u,y,temp,NULL,NULL);
 
 			GP4_BIND_POLY(); memset(mat,0,sizeof(mat)); memset(rhs,0,sizeof(rhs));
 			for(i=0;i<GP4_L;i++){ for(j=0;j<GP4_L;j++) mat[i][j]=GPDot(rr[i+1],rr[j+1],&Timing_OneIterComm); mat[i][GP4_L]=GPDot(rr[i+1],y,&Timing_OneIterComm); mat[GP4_L][i]=conj(mat[i][GP4_L]); rhs[i]=GPDot(rr[i+1],rr[0],&Timing_OneIterComm); }
 			mat[GP4_L][GP4_L]=GPDot(y,y,&Timing_OneIterComm); rhs[GP4_L]=GPDot(y,rr[0],&Timing_OneIterComm);
-			if (!GPSolveSmallN(&mat[0][0],rhs,GP4_L+1,GP4_L+1))
-				LogError(ONE_POS,"GPBiCGStab(4) breakdown in 5x5 minimization");
-			for (i=0;i<GP4_L;i++) zeta[i]=rhs[i];
-			eta=rhs[GP4_L];
-			IT_MULT_SELF_CMPLX(z,eta); for(i=0;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_INCREM(xvec,z,NULL,NULL);
+			mr_rank=GPSolveSmallNAdaptive(&mat[0][0],rhs,&mat_work[0][0],rhs_work,GP4_L+1,GP4_L+1);
+			if (mr_rank==0) LogError(ONE_POS,"GPBiCGStab(4) breakdown in MR minimization (rank 0)");
+			if (mr_rank<GP4_L+1 && IFROOT)
+				PrintBoth(logfile,"GPBiCGStab(4) MR happy/near breakdown: using rank %d instead of 5 at iteration %d.\n",mr_rank,niter);
+			for (i=0;i<GP4_L;i++) zeta[i]=(i<mr_rank ? rhs_work[i] : 0);
+			eta=(mr_rank>GP4_L ? rhs_work[GP4_L] : 0);
+			IT_MULT_SELF_CMPLX(z,eta); for(i=0;i<GP4_L;i++) IT_INCREM01_CMPLX(z,rr[i],zeta[i],NULL,NULL); IT_X_INCREM(z);
 			IT_MULT_SELF_CMPLX(y,eta); IT_MULT_SELF_CMPLX(u,eta); for(i=0;i<GP4_L;i++){ IT_INCREM01_CMPLX(y,rr[i+1],zeta[i],NULL,NULL); IT_INCREM01_CMPLX(u,pp[i+1],zeta[i],NULL,NULL); }
 			IT_INCREM01_CMPLX(rr[0],y,-1,NULL,NULL); IT_INCREM01_CMPLX(pp[0],u,-1,NULL,NULL); GP4_RESTORE_HISTORY(); inprodRp1=IT_NORM2(rvec,&Timing_OneIterComm); return;
 	}
@@ -1308,7 +1782,7 @@ ITER_FUNC(BiCG_CS)
  * it is also identical to COCG, described in:
  * van der Vorst H.A., Melissen J.B.M. "A Petrov-Galerkin type method for solving Ax=b, where A is symmetric complex",
  * IEEE Transactions on Magnetics, 26(2):706-708, 1990.
- * 
+ *
  * Notation that is used here actually corresponds to Figure 2.7 of Barrett et al. "Templates for the Solution of Linear
  * Systems: Building Blocks for Iterative Methods", 2nd ed., SIAM, 1994. http://www.netlib.org/templates/templates.pdf
  * after removing the second path with transposed matrix (the description in the book is for general matrix).
@@ -1320,6 +1794,7 @@ ITER_FUNC(BiCG_CS)
 	static itercomplex alpha, mu;
 	static itercomplex beta,ro_new,ro_old,temp;
 	static double dtmp,abs_ro_new;
+	static bool fresh_start;
 #ifdef OCL_BLAS
 	cl_mem bufro_new;
 	cl_mem bufmu;
@@ -1353,6 +1828,8 @@ ITER_FUNC(BiCG_CS)
 			CL_CH_ERR(clEnqueueWriteBuffer(command_queue,bufxvec,CL_FALSE,0,sizeof(doublecomplex)*local_nRows,xvec,0,
 				NULL,NULL));
 #endif
+			if (!load_chpoint || lanier_hard_restart_request) fresh_start=true;
+			else fresh_start=false;
 			return; // no specific initialization required (if not OCL_BLAS)
 		}
 		case PHASE_ITER:
@@ -1375,12 +1852,12 @@ ITER_FUNC(BiCG_CS)
 			dtmp=abs_ro_new/inprodR;
 			Dz("|rT.r|/(r.r)="GFORM_DEBUG,dtmp);
 			if (dtmp<EPS1) LogError(ONE_POS,"BiCG_CS fails: |rT.r|/(r.r) is too small ("GFORM_DEBUG").",dtmp);
-			if (niter==1) {
+			if (fresh_start) {
 #ifdef OCL_BLAS
 				clEnqueueCopyBuffer(command_queue,bufrvec,bufpvec,0,0,sizeof(doublecomplex)*local_nRows,0,NULL,NULL);
 #else
 				IT_COPY(pvec,rvec); // p_1=r_0
-#endif 
+#endif
 			}
 			else {
 				// beta_k-1=ro_k-1/ro_k-2
@@ -1396,7 +1873,7 @@ ITER_FUNC(BiCG_CS)
 #endif
 			}
 			// q_k=Avecbuffer=A.p_k
-			if (niter==1 && matvec_ready) {} // do nothing, Avecbuffer is ready to use
+			if (fresh_start && matvec_ready) {} // do nothing, Avecbuffer is ready to use
 			else BICGCS_MATVEC(pvec,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			// mu_k=p_k.q_k; check for mu_k!=0
 #ifdef OCL_BLAS
@@ -1416,7 +1893,7 @@ ITER_FUNC(BiCG_CS)
 			cl_double2 clalpha = {.s={creal(alpha),cimag(alpha)}};
 			CLBLAS_CH_ERR(clblasZaxpy(local_nRows,clalpha,bufpvec,0,1,bufxvec,0,1,1,&command_queue,0,NULL,NULL));
 #else
-			IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+			IT_X_INCREM01_CMPLX(pvec,alpha);
 #endif
 			// r_k=r_k-1-alpha_k*A.p_k and |r_k|^2
 			temp=-alpha;
@@ -1455,6 +1932,7 @@ ITER_FUNC(BiCG_CS)
 #endif
 			// initialize ro_old -> ro_k-2 for next iteration
 			ro_old=ro_new;
+			fresh_start=false;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -1475,6 +1953,7 @@ ITER_FUNC(BiCGStab)
 	static double denumOmega,dtmp;
 	static itercomplex beta,ro_new,ro_old,omega,alpha,temp1,temp2;
 	static doublecomplex * restrict v,* restrict s,* restrict rtilda;
+	static bool fresh_start;
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -1495,12 +1974,13 @@ ITER_FUNC(BiCGStab)
 			vectors[0].size=vectors[1].size=vectors[2].size=sizeof(doublecomplex);
 			return;
 		case PHASE_INIT:
-			if (!load_chpoint) IT_COPY(rtilda,rvec); // r~=r_0
+			if (!load_chpoint || lanier_hard_restart_request) { IT_COPY(rtilda,rvec); fresh_start=true; } // r~=r_0
+			else fresh_start=false;
 			return;
 		case PHASE_ITER:
 			// ro_k-1=r_k-1.r~ ; check for ro_k-1!=0
 			ro_new=IT_DOT(rvec,rtilda,&Timing_OneIterComm);
-			if (niter==1) IT_COPY(pvec,rvec); // p_1=r_0
+			if (fresh_start) IT_COPY(pvec,rvec); // p_1=r_0
 			else {
 				// beta_k-1=(ro_k-1/ro_k-2)*(alpha_k-1/omega_k-1)
 				temp1=ro_new*alpha;
@@ -1515,7 +1995,7 @@ ITER_FUNC(BiCGStab)
 				IT_INCREM110_CMPLX(pvec,v,rvec,beta,temp1);
 			}
 			// calculate v_k=A.p_k
-			if (niter==1 && matvec_ready) IT_COPY(v,Avecbuffer);
+			if (fresh_start && matvec_ready) IT_COPY(v,Avecbuffer);
 			else IT_MATVEC(pvec,v,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			// alpha_k=ro_new/(v_k.r~)
 			temp1=IT_DOT(v,rtilda,&Timing_OneIterComm);
@@ -1529,7 +2009,7 @@ ITER_FUNC(BiCGStab)
 			// check convergence at this step; if yes, checkpoint should not be saved afterwards
 			if (inprodRp1<epsB && chp_type!=CHP_ALWAYS) {
 				// x_k=x_k-1+alpha_k*p_k
-				IT_INCREM01_CMPLX(xvec,pvec,alpha,NULL,NULL);
+				IT_X_INCREM01_CMPLX(pvec,alpha);
 				complete=false;
 			}
 			else {
@@ -1538,13 +2018,14 @@ ITER_FUNC(BiCGStab)
 				// omega_k=s.t/|t|^2
 				omega=IT_DOT(s,Avecbuffer,&Timing_OneIterComm)/denumOmega;
 				// x_k=x_k-1+alpha_k*p_k+omega_k*s
-				IT_INCREM011_CMPLX(xvec,pvec,s,alpha,omega);
+				IT_X_INCREM011_CMPLX(pvec,s,alpha,omega);
 				// r_k=s-omega_k*t and |r_k|^2
 				temp1=-omega;
 				IT_LINCOMB1_CMPLX(rvec,Avecbuffer,s,temp1,&inprodRp1,&Timing_OneIterComm);
 				// initialize ro_old -> ro_k-2 for next iteration
 				ro_old=ro_new;
 			}
+			fresh_start=false;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -1562,17 +2043,20 @@ ITER_FUNC(CGNR)
 {
 	static double alpha, denumeratorAlpha;
 	static double beta,ro_new,ro_old;
+	static bool fresh_start;
 
 	switch (ph) {
 		case PHASE_VARS:
 			scalars[0].ptr=&ro_old;
 			scalars[0].size=sizeof(double);
 			return;
-		case PHASE_INIT: return; // no specific initialization required
+		case PHASE_INIT:
+			fresh_start=(!load_chpoint || lanier_hard_restart_request);
+			return; // no other specific initialization required
 		case PHASE_ITER:
 			// p_1=Ah.r_0 and ro_new=ro_0=|Ah.r_0|^2
 			// since first product is with Ah , matvec_ready can't be employed
-			if (niter==1) IT_MATVEC(rvec,pvec,&ro_new,true,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
+			if (fresh_start) IT_MATVEC(rvec,pvec,&ro_new,true,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			else {
 				// Avecbuffer=AH.r_k-1, ro_new=ro_k-1=|AH.r_k-1|^2
 				IT_MATVEC(rvec,Avecbuffer,&ro_new,true,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
@@ -1586,11 +2070,12 @@ ITER_FUNC(CGNR)
 			IT_MATVEC(pvec,Avecbuffer,&denumeratorAlpha,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
 			alpha=ro_new/denumeratorAlpha;
 			// x_k=x_k-1+alpha_k*p_k
-			IT_INCREM01(xvec,pvec,alpha,NULL,NULL);
+			IT_X_INCREM01(pvec,alpha);
 			// r_k=r_k-1-alpha_k*A.p_k and |r_k|^2
 			IT_INCREM01(rvec,Avecbuffer,-alpha,&inprodRp1,&Timing_OneIterComm);
 			// initialize ro_old -> ro_k-2 for next iteration
 			ro_old=ro_new;
+			fresh_start=false;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -1611,6 +2096,7 @@ ITER_FUNC(CSYM)
 	static itercomplex alpha,gamma,invksi,theta,eta,tau,temp1,temp2,s_old,s_new;
 	static double dtmp,beta,c_old,c_new;
 	static doublecomplex *q_new,*q_old,*p_new,*p_old; // can't be declared restrict due to SwapPointers
+	static int cycle_iter; // iteration number since the latest reliable/hard restart
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -1633,21 +2119,26 @@ ITER_FUNC(CSYM)
 			vectors[0].size=vectors[1].size=sizeof(doublecomplex);
 			return;
 		case PHASE_INIT:
-			if (load_chpoint) { // change pointers names according to count parity
+			if (load_chpoint && !lanier_hard_restart_request) { // change pointers names according to count parity
 				/* change pointers names according to count parity. Based on the fact that first two are swapped at each
 				 * iteration (and niter>=1), while second two - at each iteration starting from niter=2.
 				 */
 				if (IS_EVEN(niter)) SwapPointers(&q_old,&q_new);
 				else if (niter>1) SwapPointers(&p_old,&p_new);
+				cycle_iter=niter;
 			}
 			else {
-				// tau_1 = ||r_0||; q_1 = r_0(*)/||r_0||; here r_0 is already stored in q_old
+				/* Restore canonical aliases after a hard restart; repeated swaps from the
+				 * previous Krylov cycle must not leak into the new cycle. */
+				q_new=rvec; q_old=vec1; p_new=pvec; p_old=vec2;
+				// tau_1 = ||r_0||; q_1 = r_0(*)/||r_0||
 				tau=sqrt(inprodR);
 				IT_MULT_SELF_CONJ(q_new,1/creal(tau));
 				// c_0=1; c_-1=0; s_0=s_-1=0
 				c_new=1;
 				c_old=0;
 				s_new=s_old=0;
+				cycle_iter=1;
 			}
 			return;
 		case PHASE_ITER:
@@ -1666,7 +2157,7 @@ ITER_FUNC(CSYM)
 			// w = Aq_k - alpha_k*q_k(*) - beta_k*q_k-1(*); w is stored in q_old
 			temp1=-alpha; // temp1 = -alpha_k
 			// use explicitly that q_0=0
-			if (niter==1) IT_LINCOMB1_CMPLX_CONJ(q_old,q_new,Avecbuffer,temp1,&dtmp,&Timing_OneIterComm);
+			if (cycle_iter==1) IT_LINCOMB1_CMPLX_CONJ(q_old,q_new,Avecbuffer,temp1,&dtmp,&Timing_OneIterComm);
 			else IT_INCREM110_D_C_CONJ(q_old,q_new,Avecbuffer,-beta,temp1,&dtmp,&Timing_OneIterComm);
 			// beta_k+1 = ||w|| (after that beta is beta_k+1)
 			// if beta=0 this is the last iteration, following formulae work fine in this case
@@ -1698,10 +2189,10 @@ ITER_FUNC(CSYM)
 				s_new=beta*invksi;
 			}
 			// p_k=(-theta_k*p_k-2-eta_k*p_k-1+q_k)/ksi_k
-			if (niter==1) IT_MULT_CMPLX(p_new,q_new,invksi); // use implicitly that p_0=p_-1=0
+			if (cycle_iter==1) IT_MULT_CMPLX(p_new,q_new,invksi); // use implicitly that p_0=p_-1=0
 			else {
 				temp1=-eta*invksi;
-				if (niter==2) IT_LINCOMB_CMPLX(p_old,p_new,q_new,temp1,invksi,NULL,NULL); // use explicitly that p_0=0
+				if (cycle_iter==2) IT_LINCOMB_CMPLX(p_old,p_new,q_new,temp1,invksi,NULL,NULL); // use explicitly that p_0=0
 				else {
 					temp2=-theta*invksi;
 					IT_INCREM111_CMPLX(p_old,p_new,q_new,temp2,temp1,invksi);
@@ -1710,13 +2201,25 @@ ITER_FUNC(CSYM)
 			}
 			// x_k=x_k-1+tau_k*c_k*p_k
 			temp1=c_new*tau;
-			IT_INCREM01_CMPLX(xvec,p_new,temp1,NULL,NULL);
+			IT_X_INCREM01_CMPLX(p_new,temp1);
 			// q_k+1 = w(*)/beta_k+1; it is first stored into q_old and then swapped
 			IT_MULT_SELF_CONJ(q_old,1/beta);
 			SwapPointers(&q_old,&q_new);
 			// tau_k+1 = -s_k*tau_k; ||r_k|| = |tau_k+1|
 			tau*=-s_new;
 			inprodRp1=IterAbs2(tau);
+#ifdef ADDA_CUDA
+			if (lanier_cs_congruence) {
+				/* CSYM stores only ||r_k|| recursively. Reconstruct the actual
+				 * recurrence residual r_k=tau*conj(q_{k+1}) in scratch so the
+				 * DDSCAT-style vector-gap test remains exact. */
+				IT_COPY(Avecbuffer,q_new);
+				IT_MULT_SELF_CONJ(Avecbuffer,1.0);
+				IT_MULT_SELF_CMPLX(Avecbuffer,tau);
+				lanier_recursive_residual_vec=Avecbuffer;
+			}
+#endif
+			cycle_iter++;
 #ifdef WORKAROUND146
 			dumb=tau;
 #endif
@@ -1740,6 +2243,7 @@ ITER_FUNC(QMR_CS)
 	static itercomplex alpha,beta,theta,eta,zeta,zetatilda,tau,tautilda;
 	static itercomplex s_new,s_old,temp1,temp2,temp4;
 	static doublecomplex *v,*vtilda,*p_new,*p_old; // can't be declared restrict due to SwapPointers
+	static int cycle_iter; // iteration number since the latest reliable/hard restart
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -1765,14 +2269,17 @@ ITER_FUNC(QMR_CS)
 			vectors[0].size=vectors[1].size=vectors[2].size=sizeof(doublecomplex);
 			return;
 		case PHASE_INIT:
-			if (load_chpoint) {
+			if (load_chpoint && !lanier_hard_restart_request) {
 				/* change pointers names according to count parity. Based on the fact that first two are swapped at each
 				 * iteration (and niter>=1), while second two - at each iteration starting from niter=2.
 				 */
 				if (IS_EVEN(niter)) SwapPointers(&v,&vtilda);
 				else if (niter>1) SwapPointers(&p_old,&p_new);
+				cycle_iter=niter;
 			}
 			else {
+				/* Restore canonical aliases after a reliable/hard restart. */
+				v=vec1; vtilda=vec2; p_new=pvec; p_old=vec3;
 				// omega_0=||v_0||=0
 				omega_old=0.0;
 				// beta_1=sqrt(v~_1(*).v~_1); omega_1=||v~_1||/|beta_1|; (v~_1=r_0)
@@ -1786,6 +2293,7 @@ ITER_FUNC(QMR_CS)
 				// c_0=c_-1=1; s_0=s_-1=0
 				c_new=c_old=1.0;
 				s_new=s_old=0.0;
+				cycle_iter=1;
 #ifdef WORKAROUND146
 				dumb=beta;
 #endif
@@ -1797,7 +2305,7 @@ ITER_FUNC(QMR_CS)
 			Dz("|vT.v|/(v.v)="GFORM_DEBUG,dtmp1);
 			if (dtmp1<EPS1) LogError(ONE_POS,"QMR_CS fails: |vT.v|/(v.v) is too small ("GFORM_DEBUG").",dtmp1);
 			// A.v_k; alpha_k=v_k(*).(A.v_k)
-			if (niter==1 && matvec_ready) { // uses that v_1=r_0/beta
+			if (cycle_iter==1 && matvec_ready) { // uses that v_1=r_0/beta
 				temp1=1/beta;
 				IT_MULT_SELF_CMPLX(Avecbuffer,temp1);
 			}
@@ -1805,7 +2313,7 @@ ITER_FUNC(QMR_CS)
 			alpha=IT_DOTU(v,Avecbuffer,&Timing_OneIterComm);
 			// v~_k+1=-beta_k*v_k-1-alpha_k*v_k+A.v_k
 			temp2=-alpha;
-			if (niter==1) IT_LINCOMB1_CMPLX(vtilda,v,Avecbuffer,temp2,NULL,NULL); // use explicitly that v_0=0
+			if (cycle_iter==1) IT_LINCOMB1_CMPLX(vtilda,v,Avecbuffer,temp2,NULL,NULL); // use explicitly that v_0=0
 			else {
 				temp1=-beta;
 				IT_INCREM110_CMPLX(vtilda,v,Avecbuffer,temp1,temp2);
@@ -1841,10 +2349,10 @@ ITER_FUNC(QMR_CS)
 			s_new=omega_new*beta/zeta;
 			// p_k=(-theta_k*p_k-2-eta_k*p_k-1+v_k)/zeta_k
 			temp4=1/zeta; // temp4=1/zeta_k;
-			if (niter==1) IT_MULT_CMPLX(p_new,v,temp4); // use implicitly that p_0=p_-1=0
+			if (cycle_iter==1) IT_MULT_CMPLX(p_new,v,temp4); // use implicitly that p_0=p_-1=0
 			else {
 				temp2=-eta*temp4; // temp2=-eta_k/zeta_k
-				if (niter==2) IT_LINCOMB_CMPLX(p_old,p_new,v,temp2,temp4,NULL,NULL);
+				if (cycle_iter==2) IT_LINCOMB_CMPLX(p_old,p_new,v,temp2,temp4,NULL,NULL);
 				else {
 					temp1=-theta*temp4; // temp1=-theta_k/zeta_k
 					IT_INCREM111_CMPLX(p_old,p_new,v,temp1,temp2,temp4);
@@ -1856,7 +2364,7 @@ ITER_FUNC(QMR_CS)
 			// tau~_k+1=-s_k*tau~_k
 			tautilda=-s_new*tautilda;
 			// x_k=x_k-1+tau_k*p_k
-			IT_INCREM01_CMPLX(xvec,p_new,tau,NULL,NULL);
+			IT_X_INCREM01_CMPLX(p_new,tau);
 			// v_k+1=v~_k+1/beta_k+1
 			temp1=1/beta;
 			IT_MULT_SELF_CMPLX(vtilda,temp1);
@@ -1864,6 +2372,7 @@ ITER_FUNC(QMR_CS)
 			// r_k = |s_k|^2*r_k-1 + (c_k*tau~_k+1/omega_k+1)*v_k+1
 			temp1=(c_new/omega_new)*tautilda;
 			IT_INCREM11_D_C(rvec,v,IterAbs2(s_new),temp1,&inprodRp1,&Timing_OneIterComm);
+			cycle_iter++;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -1887,6 +2396,7 @@ ITER_FUNC(QMR_CS_2)
 	static double c_old,c_new,theta_old,theta_new,ro_old,ro_new,sabs2,dtmp1;
 	static itercomplex eps,beta,delta,eta,temp1;
 	static doublecomplex * restrict v,* restrict d;
+	static int cycle_iter; // iteration number since the latest reliable/hard restart
 
 	switch (ph) {
 		case PHASE_VARS:
@@ -1906,7 +2416,7 @@ ITER_FUNC(QMR_CS_2)
 			vectors[0].size=vectors[1].size=sizeof(doublecomplex);
 			return;
 		case PHASE_INIT:
-			if (!load_chpoint) {
+			if (!load_chpoint || lanier_hard_restart_request) {
 				// ro_1=||r_0||; v~_1=r_0
 				ro_old=sqrt(inprodR);
 				IT_COPY(v,rvec);
@@ -1915,10 +2425,12 @@ ITER_FUNC(QMR_CS_2)
 				eps=1;
 				theta_old=0;
 				eta=-1;
+				cycle_iter=1;
 #ifdef WORKAROUND146
 				dumb=eps;
 #endif
 			}
+			else cycle_iter=niter;
 			return;
 		case PHASE_ITER:
 			// v_k = v~_k/ro_k; this is rearranged as compared to the original algorithm
@@ -1930,13 +2442,13 @@ ITER_FUNC(QMR_CS_2)
 			Dz("|vT.v|="GFORM_DEBUG,dtmp1);
 			if (dtmp1<EPS1) LogError(ONE_POS,"QMR_CS_2 fails: |vT.v| is too small ("GFORM_DEBUG").",dtmp1);
 			// p_k = v_k - p_k-1*ro_k*delta_k/eps_k-1
-			if (niter==1) IT_COPY(pvec,v); // use explicitly that p_0=0
+			if (cycle_iter==1) IT_COPY(pvec,v); // use explicitly that p_0=0
 			else {
 				temp1=-ro_old*delta/eps;
 				IT_INCREM10_CMPLX(pvec,v,temp1,NULL,NULL);
 			}
 			// A.p_k
-			if (niter==1 && matvec_ready) { // uses that p_1=v_1=r_0/ro_1
+			if (cycle_iter==1 && matvec_ready) { // uses that p_1=v_1=r_0/ro_1
 				IT_MULT_SELF(Avecbuffer,1/ro_old);
 			}
 			else IT_MATVEC(pvec,Avecbuffer,NULL,false,&Timing_OneIterMVP,&Timing_OneIterMVPComm);
@@ -1960,13 +2472,13 @@ ITER_FUNC(QMR_CS_2)
 			dtmp1=c_new/c_old;
 			eta=-ro_old*dtmp1*dtmp1*eta/beta;
 			// d_k = p_k*eta_k + d_k-1*(theta_k-1*c_k)^2
-			if (niter==1) IT_MULT_CMPLX(d,pvec,eta); // use explicitly that d_0=0
+			if (cycle_iter==1) IT_MULT_CMPLX(d,pvec,eta); // use explicitly that d_0=0
 			else {
 				dtmp1=theta_old*c_new;
 				IT_INCREM11_D_C(d,pvec,dtmp1*dtmp1,eta,NULL,NULL);
 			}
 			// x_k = x_k-1 + d_k
-			IT_INCREM(xvec,d,NULL,NULL);
+			IT_X_INCREM(d);
 			/* The following formula to update residual was not given in the original publication, we derived it
 			 * ourselves; r_k = (1-c_k^2)*r_k-1 - eta_k*v~_k+1
 			 */
@@ -1976,6 +2488,7 @@ ITER_FUNC(QMR_CS_2)
 			ro_old=ro_new;
 			theta_old=theta_new;
 			c_old=c_new;
+			cycle_iter++;
 			return; // end of PHASE_ITER
 	}
 	LogError(ONE_POS,"Unknown phase (%d) of the iterative solver",(int)ph);
@@ -2011,6 +2524,10 @@ ITER_FUNC(QMR_CS_2)
 #undef IT_LINCOMB_CMPLX
 #undef IT_LINCOMB1_CMPLX
 #undef IT_LINCOMB1_CMPLX_CONJ
+#undef IT_X_INCREM
+#undef IT_X_INCREM01
+#undef IT_X_INCREM01_CMPLX
+#undef IT_X_INCREM011_CMPLX
 
 /* TO ADD NEW ITERATIVE SOLVER
  * Add the function implementing the iterative method to the list above in the alphabetical order. The template for the
@@ -2261,13 +2778,14 @@ static const char *CalcInitField(double zero_resid,const enum incpol which)
 
 //======================================================================================================================
 
-int IterativeSolver(const enum iter method_in,const enum incpol which)
+static int IterativeSolverCore(const enum iter method_in,const enum incpol which)
 /* choose required iterative method; do common initialization part;
  * 'which' is used only if the initial field is read from file
  */
 {
 	double temp;
 	char tmp_str[MAX_LINE];
+	const char *init_descr=NULL;
 	TIME_TYPE tstart,time_tmp,time_tmp2,time_tmp3;
 
 	// redundant initialization to remove warnings
@@ -2287,23 +2805,33 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	Timing_InitIterComm=Timing_MVP=Timing_MVPComm=0;
 	tstart=GET_TIME();
 	matvec_ready=false; // can be set to true only in CalcInitField (if !load_chpoint)
+#ifdef ADDA_CUDA
+	lanier_true_converged=false;
+	lanier_physical_rhs_norm2=0.0;
+	lanier_reset_baseline=1.0;
+	lanier_reset_mandatory_count=lanier_reset_ratio_count=lanier_reset_reliable_count=0;
+	lanier_recursive_residual_vec=rvec;
+#endif
 	if (!load_chpoint) {
 		nMult_mat(pvec,Einc,cc_sqrt);
 		temp=nNorm2(pvec,&Timing_InitIterComm); // |S.Einc|^2, but also equal to |r_0|^2 when x_0=0
+#ifdef ADDA_CUDA
+		lanier_physical_rhs_norm2=temp;
+#endif
 		resid_scale=1/temp;
 		epsB=iter_eps*iter_eps*temp;
-		// Calculate initial field
-		const char *descr=CalcInitField(temp,which);
-		// print start values
-		if (IFROOT) {
-			prev_err=sqrt(resid_scale*inprodR);
-			SnprintfErr(ONE_POS,tmp_str,MAX_LINE,RESID_STRING"\n",0,prev_err);
-			// descr may contain filename, thus it is given as a separate argument (not included in tmp_str)
-			if (!orient_avg) {
-				fprintf(logfile,"%s\n%s",descr,tmp_str);
-			}
-			PRINTFB("%s\n%s",descr,tmp_str);
+		// Calculate initial field. Printing is delayed until after an optional
+		// Lanier complex-symmetric residual-space transformation.
+#ifdef ADDA_CUDA
+		if (lanier_partition_use_existing_x) {
+			/* xvec is already in ADDA's transformed unknown y=S^-1 p. */
+			MatVec(xvec,Avecbuffer,NULL,false,&Timing_MVP,&Timing_MVPComm);
+			nSubtr(rvec,pvec,Avecbuffer,&inprodR,&Timing_InitIterComm);
+			init_descr="x_0 = LANIER_PARTITION warm start";
 		}
+		else
+#endif
+			init_descr=CalcInitField(temp,which);
 		// initialize counters
 		niter=1;
 		counter=0;
@@ -2325,6 +2853,28 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	if (reliable_resid)
 		LogWarning(EC_WARN,ONE_POS,"-reliable_resid currently applies only to CUDA float32 BiCGStab(2)/BCGS2 and GPBiCGStab(2); option ignored");
 #endif
+	if (lanier_precon) {
+#ifndef ADDA_CUDA
+		LogError(ONE_POS,"Lanier preconditioners require an ADDA CUDA executable");
+#else
+		/* The validated reference 1x/1.5x path remains deliberately restricted
+		 * to BCGS2. LANIER_FULL is integrated with every CUDA iterative solver. */
+		if (!lanier_full_precon && method_in!=IT_BCGS2)
+			LogError(ONE_POS,"Lanier reference 1x/1.5x currently supports only -iter bcgs2; use -precon lanier_full for the all-solver path");
+		if (!lanier_full_precon && Nmat!=1)
+			LogError(ONE_POS,"Lanier reference preconditioner currently requires one homogeneous material");
+		if (surface)
+			LogError(ONE_POS,"Lanier preconditioners currently do not support -surf");
+		if (lanier_full_precon && rectDip)
+			LogError(ONE_POS,"Lanier full TQC-v1 currently requires isotropic cubic voxels (no -rect_dip)");
+		if ((lanier_multizone_schwarz_precon || lanier_multizone_schwarz_sym_precon || lanier_multizone_schwarz_reverse_precon || lanier_multizone_schur_precon) && !LanierSchwarzSupportedMethod(method_in))
+			LogError(ONE_POS,"LANIER_MULTIZONE nonsymmetric Schwarz modes and Schur V2.1 support -iter bcgs2, bicgstab, bicgstab4, gpbicgstab2, or gpbicgstab4. BiCG/CGNR and complex-symmetric solver integration remain intentionally disabled.");
+		lanier_cs_congruence=lanier_full_precon && !lanier_multizone_schwarz_precon && !lanier_multizone_schwarz_sym_precon && !lanier_multizone_schwarz_reverse_precon && !lanier_multizone_schur_precon && LanierComplexSymmetricMethod(method_in);
+#endif
+	}
+#ifdef ADDA_CUDA
+	else lanier_cs_congruence=false;
+#endif
 	// initialize data required for checkpoints and specific variables
 	chp_exit=false;
 	complete=true;
@@ -2340,20 +2890,65 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 #ifdef ADDA_CUDA
 	/* Initial-field/checkpoint construction above is still host-side. Upload the
 	 * complete iterative-solver state once, immediately before the solver starts using GPU vectors. */
-	if (method_in==IT_BICGSTAB4 || method_in==IT_GPBICGSTAB4) {
+	if (method_in==IT_BICGSTAB4 || method_in==IT_BICGSTAB8 || method_in==IT_BICGSTAB12 || method_in==IT_GPBICGSTAB4) {
 		const size_t extra=(size_t)params[ind_m].vec_N;
-		const size_t work_extra=(method_in==IT_GPBICGSTAB4 ? 1u : 0u);
+		/* Reliable true-residual control needs Avecbuffer as a resident scratch
+		 * vector for both L=4 solvers. GPBiCGStab(4) already required it;
+		 * BiCGStab(4) now registers the same scratch explicitly. */
+		const size_t work_extra=1u;
 		const size_t count=3u+extra+work_extra;
-		const void *ids[15];
+		const void *ids[32];
 		size_t ci=0,k;
 		ids[ci++]=xvec; ids[ci++]=rvec; ids[ci++]=pvec;
 		for (k=0;k<extra;k++) ids[ci++]=vectors[k].ptr;
-		if (work_extra) ids[ci++]=Avecbuffer;
-		CudaIterInitList(ids,count,method_in==IT_BICGSTAB4 ? "BiCGStab(4)" : "GPBiCGStab(4)");
+		ids[ci++]=Avecbuffer;
+		CudaIterInitList(ids,count,method_in==IT_BICGSTAB4 ? "BiCGStab(4)" : (method_in==IT_BICGSTAB8 ? "BiCGStab(8)" : (method_in==IT_BICGSTAB12 ? "BiCGStab(12)" : "GPBiCGStab(4)")));
 	}
 	else CudaIterInit((int)method_in);
+	if (lanier_precon) {
+		CudaLanierInit();
+		if (lanier_full_precon && !(lanier_physical_rhs_norm2>0.0))
+			lanier_physical_rhs_norm2=PhysicalRHSNorm2();
+		/* Any cached CalcInitField MatVec is the unpreconditioned physical A
+		 * product and must not be reused by a preconditioned recurrence. */
+		matvec_ready=false;
+		if (lanier_cs_congruence && !load_chpoint) {
+			/* Complex-symmetric solvers run on P*A*P. Keep xvec physical, but
+			 * transform r0 -> P*r0 and scale convergence by ||P*b||. */
+			CudaLanierApply(rvec,rvec);
+			CudaLanierApply(pvec,Avecbuffer);
+			inprodR=CudaIterNorm2(rvec,&Timing_InitIterComm);
+			temp=CudaIterNorm2(Avecbuffer,&Timing_InitIterComm);
+			if (temp==0) LogError(ONE_POS,"Lanier complex-symmetric transformed right-hand side has zero norm");
+			resid_scale=1/temp;
+			epsB=iter_eps*iter_eps*temp;
+			if (IFROOT) PrintBoth(logfile,
+				lanier_multizone_schwarz_sym_precon ? "LANIER_MULTIZONE_SCHWARZ_SYM solver integration: symmetric multiplicative Schwarz right preconditioning A*P_SMS.\n" : (lanier_multizone_schwarz_precon ? "LANIER_MULTIZONE_SCHWARZ solver integration: fixed-order multiplicative Schwarz right preconditioning A*P_MS.\n" : (lanier_multizone_precon ? "LANIER_MULTIZONE solver integration: N-zone block-Jacobi complex-symmetric congruence P*A*P with residual P*(b-Ax).\n" :
+				(lanier_nested_precon ? "LANIER_NESTED solver integration: block-Jacobi complex-symmetric congruence P*A*P with residual P*(b-Ax).\n" :
+				"LANIER_FULL solver integration: complex-symmetric congruence P*A*P with residual P*(b-Ax).\n"))));
+		}
+	}
 #endif
+	if (!load_chpoint && IFROOT) {
+		prev_err=sqrt(resid_scale*inprodR);
+		SnprintfErr(ONE_POS,tmp_str,MAX_LINE,RESID_STRING"\n",0,prev_err);
+		if (!orient_avg) fprintf(logfile,"%s\n%s",init_descr,tmp_str);
+		PRINTFB("%s\n%s",init_descr,tmp_str);
+	}
 	(*params[ind_m].func)(PHASE_INIT);
+#ifdef ADDA_CUDA
+	if (lanier_full_precon) {
+		lanier_reset_baseline=sqrt(MAX(0.0,resid_scale*inprodR));
+		if (IFROOT) PrintBoth(logfile,
+			lanier_multizone_schur_precon ? "LANIER_MULTIZONE_SCHUR DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			(lanier_multizone_schwarz_reverse_precon ? "LANIER_MULTIZONE_SCHWARZ_REVERSE DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			(lanier_multizone_schwarz_sym_precon ? "LANIER_MULTIZONE_SCHWARZ_SYM DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			(lanier_multizone_schwarz_precon ? "LANIER_MULTIZONE_SCHWARZ DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			(lanier_multizone_precon ? "LANIER_MULTIZONE DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			(lanier_nested_precon ? "LANIER_NESTED DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n" :
+			"LANIER_FULL DDSCAT reset policy: mandatory reset after iteration 3; ratio R=100; true physical residual every 20 iterations; vector-gap restart >= 0.01.\n"))))));
+	}
+#endif
 	// Initialization time includes generating the incident beam
 	Timing_InitIter = GET_TIME() - tstart;
 	Timing_InitIterComm += Timing_MVPComm; // Timing_MVPComm should (by here) include only iteration initialization
@@ -2364,53 +2959,104 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	CudaIterPrintMemoryBeforeLoop();
 #endif
 	// main iteration cycle
+	/* For Lanier complex-symmetric congruence solvers the recurrence residual
+	 * lives in the transformed space P*(b-Ax).  That norm may fall below its
+	 * transformed tolerance while the physical residual ||b-Ax||/||b|| is still
+	 * above iter_eps.  Therefore transformed inprodR must never terminate a
+	 * congruence solve.  ReliableResidualCheck() is the sole convergence authority
+	 * for that path and sets lanier_true_converged only after a physical check. */
+#ifdef ADDA_CUDA
+	while ((lanier_cs_congruence ? !lanier_true_converged :
+		(inprodR>epsB && !lanier_true_converged)) &&
+		niter<=maxiter && counter<=params[ind_m].mc && !chp_exit) {
+#else
 	while (inprodR>epsB && niter<=maxiter && counter<=params[ind_m].mc && !chp_exit) {
+#endif
 		// initialize time
 		Timing_OneIterComm=Timing_OneIterMVP=Timing_OneIterMVPComm=0;
 		tstart=GET_TIME();
 		// main execution
+#ifdef ADDA_CUDA
+		lanier_recursive_residual_vec=rvec; // CSYM overrides this with its reconstructed r_k
+#endif
 		(*params[ind_m].func)(PHASE_ITER);
-#if defined(ADDA_CUDA) && defined(ADDA_SINGLE)
-		if (reliable_resid && (method_in==IT_GPBICGSTAB2 || method_in==IT_BCGS2) && complete &&
+#ifdef ADDA_CUDA
+		if (lanier_full_precon) {
+			const double recursive_norm2=inprodRp1;
+			const double recursive_err=sqrt(MAX(0.0,resid_scale*recursive_norm2));
+			const bool mandatory=(niter==3 && niter<maxiter);
+			const bool ratio_reset=(niter>3 && niter<maxiter && lanier_reset_baseline>0.0 &&
+				recursive_err < lanier_reset_baseline/LANIER_RESET_RATIO);
+			const bool periodic=((niter%LANIER_RELIABLE_PERIOD)==0);
+			const bool recursive_claim=(recursive_norm2<=epsB);
+			if (mandatory || ratio_reset || periodic || recursive_claim) {
+				const bool force_restart=(mandatory || ratio_reset);
+				const reliable_residual_result rr=ReliableResidualCheck(method_in,recursive_norm2,
+					LANIER_RELIABLE_GAP_TOL,force_restart);
+				const char *reason=mandatory ? "mandatory-after-3" :
+					(ratio_reset ? "ratio-R100" : (periodic ? "periodic-20" : "recursive-convergence"));
+				if (IFROOT) PrintBoth(logfile,
+					"%s %s reliable residual at iteration %d: reason=%s recursive="EFORM
+					", physical_true="EFORM", gap="GFORM"%s\n",
+					LanierMethodName(method_in),lanier_multizone_schur_precon ? "LANIER_MULTIZONE_SCHUR" : (lanier_multizone_schwarz_reverse_precon ? "LANIER_MULTIZONE_SCHWARZ_REVERSE" : (lanier_multizone_schwarz_sym_precon ? "LANIER_MULTIZONE_SCHWARZ_SYM" : (lanier_multizone_schwarz_precon ? "LANIER_MULTIZONE_SCHWARZ" : (lanier_multizone_precon ? "LANIER_MULTIZONE" : (lanier_nested_precon ? "LANIER_NESTED" : "LANIER_FULL"))))),niter,reason,recursive_err,rr.physical_rel,rr.gap,
+					rr.true_converged ? "; TRUE CONVERGENCE" : (rr.restart ? "; RESET" : "; continue"));
+				if (rr.true_converged) {
+					lanier_true_converged=true;
+				}
+				else if (rr.restart) {
+					RestartKrylovFromTrueResidual(method_in,rr.recurrence_true_norm2);
+					lanier_reset_baseline=sqrt(MAX(0.0,resid_scale*rr.recurrence_true_norm2));
+					if (mandatory) lanier_reset_mandatory_count++;
+					else if (ratio_reset) lanier_reset_ratio_count++;
+					else lanier_reset_reliable_count++;
+				}
+			}
+		}
+		/* -recalc_resid is also an in-iteration reliability policy in ADDA-CUDA.
+		 * For every CUDA solver, independently recompute the physical residual every
+		 * RECALC_RELIABLE_PERIOD iterations and whenever recursive convergence is
+		 * claimed. If the vector residual gap is too large, restart the Krylov
+		 * recurrence from the independently recomputed true residual.
+		 *
+		 * LANIER_FULL/NESTED/MULTIZONE use the stronger policy above (mandatory
+		 * iteration-3 and ratio-R100 resets in addition to the same periodic idea),
+		 * so this generic branch is reached only for the remaining configurations. */
+		else if (recalc_resid &&
+			((niter%RECALC_RELIABLE_PERIOD)==0 || inprodRp1<=epsB)) {
+			const double recursive_norm2=inprodRp1;
+			const reliable_residual_result rr=ReliableResidualCheck(method_in,recursive_norm2,
+				RECALC_RELIABLE_GAP_TOL,false);
+			if (IFROOT) {
+				const double recursive_err=sqrt(MAX(0.0,resid_scale*recursive_norm2));
+				const char *reason=((niter%RECALC_RELIABLE_PERIOD)==0 ? "periodic-20" : "recursive-convergence");
+				PrintBoth(logfile,"%s -recalc_resid check at iteration %d: reason=%s recursive="EFORM
+					", physical_true="EFORM", gap="GFORM"%s\n",LanierMethodName(method_in),niter,reason,
+					recursive_err,rr.physical_rel,rr.gap,
+					rr.true_converged ? "; TRUE CONVERGENCE" : (rr.restart ? "; RESET" : "; continue"));
+			}
+			if (rr.restart) RestartKrylovFromTrueResidual(method_in,rr.recurrence_true_norm2);
+			else if (rr.true_converged) {
+				inprodRp1=rr.recurrence_true_norm2;
+				inprodR=rr.recurrence_true_norm2;
+			}
+		}
+#if defined(ADDA_SINGLE)
+		else if (reliable_resid && (method_in==IT_GPBICGSTAB2 || method_in==IT_BCGS2) &&
 			((niter%20)==0 || inprodRp1<=epsB)) {
 			const double recursive_norm2=inprodRp1;
-			const reliable_residual_result rr=ReliableResidualCheck(method_in,recursive_norm2);
+			const reliable_residual_result rr=ReliableResidualCheck(method_in,recursive_norm2,
+				RELIABLE_GAP_TOL,reliable_resid_force_restart);
 			if (IFROOT) {
 				const char *method_name=(method_in==IT_GPBICGSTAB2 ? "GPBiCGStab(2)" : "BiCGStab(2)/BCGS2");
 				const double recursive_err=sqrt(MAX(0.0,resid_scale*recursive_norm2));
-				const double true_err=sqrt(MAX(0.0,resid_scale*rr.true_norm2));
-				const double ratio=(recursive_err>0 ? true_err/recursive_err : 0);
-				if (rr.restart) {
-					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
-						", true="EFORM", true/recursive="GFORM", gap="GFORM
-						"; Krylov recurrence restarted%s%s\n",method_name,niter,recursive_err,true_err,ratio,rr.gap,
-						rr.forced_restart ? " (forced validation restart)" : "",
-						rr.false_convergence ? " (false recursive convergence)" : "");
-				}
-				else if (rr.true_converged) {
-					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
-						", true="EFORM", true/recursive="GFORM", gap="GFORM
-						"; true residual confirms convergence\n",method_name,niter,recursive_err,true_err,ratio,rr.gap);
-				}
-				else {
-					PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
-						", true="EFORM", true/recursive="GFORM", gap="GFORM
-						"; below restart threshold "GFORM", continuing without restart\n",
-						method_name,niter,recursive_err,true_err,ratio,rr.gap,(double)RELIABLE_GAP_TOL);
-				}
+				PrintBoth(logfile,"%s reliable residual at iteration %d: recursive="EFORM
+					", true="EFORM", gap="GFORM"%s\n",method_name,niter,recursive_err,rr.physical_rel,rr.gap,
+					rr.true_converged ? "; true residual confirms convergence" : (rr.restart ? "; restarted" : "; continuing"));
 			}
-			if (rr.restart) {
-				inprodRp1=rr.true_norm2;
-				inprodR=rr.true_norm2;
-				counter=0;
-			}
-			else if (rr.true_converged) {
-				/* An independently recomputed residual satisfies the stopping
-				 * criterion. Accept it even if the recursive norm is slightly larger. */
-				inprodRp1=rr.true_norm2;
-				inprodR=rr.true_norm2;
-			}
+			if (rr.restart) RestartKrylovFromTrueResidual(method_in,rr.recurrence_true_norm2);
+			else if (rr.true_converged) { inprodRp1=rr.recurrence_true_norm2; inprodR=rr.recurrence_true_norm2; }
 		}
+#endif
 #endif
 		// finalize time; time for incomplete iteration may be inadequate
 		Timing_OneIterComm+=Timing_OneIterMVPComm;
@@ -2438,6 +3084,16 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	// Save checkpoint of type always
 	if (chp_type==CHP_ALWAYS && !chp_exit) SaveIterChpoint();
 #ifdef ADDA_CUDA
+	if (lanier_full_precon && IFROOT) PrintBoth(logfile,
+		lanier_multizone_schur_precon ? "LANIER_MULTIZONE_SCHUR DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		(lanier_multizone_schwarz_reverse_precon ? "LANIER_MULTIZONE_SCHWARZ_REVERSE DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		(lanier_multizone_schwarz_sym_precon ? "LANIER_MULTIZONE_SCHWARZ_SYM DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		(lanier_multizone_schwarz_precon ? "LANIER_MULTIZONE_SCHWARZ DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		(lanier_multizone_precon ? "LANIER_MULTIZONE DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		(lanier_nested_precon ? "LANIER_NESTED DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n" :
+		"LANIER_FULL DDSCAT reset summary: mandatory=%d ratio-R100=%d reliable-gap=%d; period=%d gap_threshold="GFORM".\n"))))),
+		lanier_reset_mandatory_count,lanier_reset_ratio_count,lanier_reset_reliable_count,
+		LANIER_RELIABLE_PERIOD,(double)LANIER_RELIABLE_GAP_TOL);
 	/* The rest of IterativeSolver (optional residual recalculation and field
 	 * post-processing) consumes host arrays. One final D2H synchronization is
 	 * therefore required when an iterative solver is CUDA-resident. */
@@ -2445,6 +3101,7 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	/* Solver-only vectors are no longer needed after the final D2H sync. Free
 	 * them now; d_arg/d_result remain available for CPU-facing MatVec(), e.g.
 	 * the optional residual recalculation below. */
+	if (lanier_precon) CudaLanierRelease();
 	CudaIterRelease();
 #endif
 	/* process incomplete convergence
@@ -2455,22 +3112,45 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	 * this may happen in the end of a long run at already low residual. However, to account for such cases one should
 	 * better use maxiter.
 	 */
+#ifdef ADDA_CUDA
+	if (lanier_cs_congruence ? !lanier_true_converged : inprodR>epsB) {
+#else
 	if (inprodR>epsB) {
+#endif
 		if (niter>maxiter) LogWarning(EC_WARN,ONE_POS,"Iterations haven't converged in %d iterations. Further "
 			"calculated scattering quantities may be less accurate.",maxiter);
 		else if (counter>params[ind_m].mc) LogError(ONE_POS,"Residual norm haven't decreased for maximum allowed "
 			"number of iterations (%d)",params[ind_m].mc);
 	}
-	if (recalc_resid) { // compute and print final residual norm
+	/* Final physical-residual validation is mandatory in every single-precision
+	 * build. In double precision it remains enabled by -recalc_resid. */
+#if defined(ADDA_SINGLE)
+	if (1) {
+#else
+	if (recalc_resid) {
+#endif
+		double report_resid_scale=resid_scale;
+#ifdef ADDA_CUDA
+		/* Complex-symmetric Lanier solvers converge in the congruence residual
+		 * norm ||P(b-Ax)||/||Pb||.  -recalc_resid must nevertheless retain
+		 * ADDA's normal physical definition ||b-Ax||/||b|| so results remain
+		 * directly comparable with NONE and with the right-preconditioned solvers. */
+		if (lanier_cs_congruence) {
+			nMult_mat(Avecbuffer,Einc,cc_sqrt);
+			temp=nNorm2(Avecbuffer,&Timing_IntFieldOneComm);
+			if (temp==0) LogError(ONE_POS,"Physical right-hand side has zero norm during residual recalculation");
+			report_resid_scale=1/temp;
+		}
+#endif
 		inprodR=ResidualNorm2(xvec,rvec,Avecbuffer,&Timing_MVP,&Timing_MVPComm,&Timing_IntFieldOneComm);
 		if (IFROOT) {
-			temp=sqrt(resid_scale*inprodR);
+			temp=sqrt(report_resid_scale*inprodR);
 			SnprintfErr(ONE_POS,tmp_str,MAX_LINE,"Final (recalculated) residual norm: "EFORM"\n",temp);
 			if (!orient_avg) fprintf(logfile,"%s",tmp_str);
 			PRINTFB("%s",tmp_str);
 		}
 	}
-	if (method_in==IT_BICGSTAB4 || method_in==IT_GPBICGSTAB4) FreeCPUL4Workspace();
+	if (method_in==IT_BICGSTAB4 || method_in==IT_BICGSTAB8 || method_in==IT_BICGSTAB12 || method_in==IT_GPBICGSTAB4) FreeCPUL4Workspace();
 	// post-processing
 	if (params[ind_m].sc_N>0) Free_general(scalars);
 	if (params[ind_m].vec_N>0) Free_general(vectors);
@@ -2480,4 +3160,297 @@ int IterativeSolver(const enum iter method_in,const enum incpol which)
 	nMult_mat(pvec,xvec,cc_sqrt); // p now contains polarizations. Can be used to calculate e.g. scattered field faster.
 	if (chp_exit) return CHP_EXIT; // check if exiting after checkpoint
 	return (niter-1); // the number of iterations elapsed
+}
+
+#ifdef ADDA_CUDA
+/* ---------------- LANIER_PARTITION_V2 ----------------
+ * Article-style separated-material partition sweep (Fig. 3):
+ *   solve object 1 -> scatter into object 2 -> solve object 2 -> reverse,
+ *   reusing previous transformed polarizations as warm starts; combine the
+ *   regional solutions and finally solve the complete physical problem.
+ *
+ * V2 keeps one regional FULL6 conditioner resident at a time and uses
+ * the user-selected iterative method for every regional and final solve.
+ * Multi-plan cuFFT caching remains deferred.
+ */
+static double PartitionRelChange(const doublecomplex *a,const doublecomplex *b,const size_t n)
+{
+    size_t i; double d=0,den=0;
+    for(i=0;i<n;i++) {
+        const double dr=creal(a[i]-b[i]),di=cimag(a[i]-b[i]);
+        const double ar=creal(a[i]),ai=cimag(a[i]);
+        d+=dr*dr+di*di; den+=ar*ar+ai*ai;
+    }
+    if(den==0) return d==0 ? 0 : HUGE_VAL;
+    return sqrt(d/den);
+}
+
+static int PartitionEnvInt(const char *name,const int defv,const int lo,const int hi)
+{
+    const char *e=getenv(name); char *end=NULL; long v;
+    if(e==NULL || e[0]=='\0') return defv;
+    v=strtol(e,&end,10);
+    if(end==e || *end!='\0' || v<lo || v>hi) {
+        LogWarning(EC_WARN,ONE_POS,"Ignoring invalid %s=%s; using %d",name,e,defv);
+        return defv;
+    }
+    return (int)v;
+}
+
+static double PartitionEnvDouble(const char *name,const double defv)
+{
+    const char *e=getenv(name); char *end=NULL; double v;
+    if(e==NULL || e[0]=='\0') return defv;
+    v=strtod(e,&end);
+    if(end==e || *end!='\0' || !(v>0) || !isfinite(v)) {
+        LogWarning(EC_WARN,ONE_POS,"Ignoring invalid %s=%s; using "GFORM,name,e,defv);
+        return defv;
+    }
+    return v;
+}
+
+static void PartitionRejectTouchingMaterials(void)
+{
+    size_t nbox,xy,i; unsigned char *occ;
+    if(boxX<=0 || boxY<=0 || boxZ<=0) LogError(ONE_POS,"LANIER_PARTITION invalid physical box");
+    xy=(size_t)boxX*(size_t)boxY;
+    if(xy/(size_t)boxY!=(size_t)boxX || xy>SIZE_MAX/(size_t)boxZ)
+        LogError(ONE_POS,"LANIER_PARTITION occupancy-map size overflow");
+    nbox=xy*(size_t)boxZ;
+    occ=(unsigned char*)malloc(nbox);
+    if(occ==NULL) LogError(ONE_POS,"Insufficient host memory validating LANIER_PARTITION separation");
+    memset(occ,0xff,nbox);
+    for(i=0;i<local_nvoid_Ndip;i++) {
+        const size_t p=3*i,x=position[p],y=position[p+1],z=position[p+2];
+        occ[(z*(size_t)boxY+y)*(size_t)boxX+x]=material[i];
+    }
+    /* Reject face/edge/corner contact. The published method is explicitly for
+     * separated regions and is known to become unstable at very small gaps. */
+    for(i=0;i<local_nvoid_Ndip;i++) {
+        const size_t p=3*i,x=position[p],y=position[p+1],z=position[p+2];
+        const unsigned char m=material[i];
+        int dx,dy,dz;
+        for(dz=-1;dz<=1;dz++)for(dy=-1;dy<=1;dy++)for(dx=-1;dx<=1;dx++) {
+            size_t qx,qy,qz; unsigned char q;
+            if(dx==0&&dy==0&&dz==0) continue;
+            if((dx<0&&x==0)||(dy<0&&y==0)||(dz<0&&z==0)) continue;
+            qx=(size_t)((long)x+dx); qy=(size_t)((long)y+dy); qz=(size_t)((long)z+dz);
+            if(qx>=(size_t)boxX||qy>=(size_t)boxY||qz>=(size_t)boxZ) continue;
+            q=occ[(qz*(size_t)boxY+qy)*(size_t)boxX+qx];
+            if(q!=0xff && q!=m) {
+                free(occ);
+                LogError(ONE_POS,
+                    "LANIER_PARTITION requires separated material regions; materials %u and %u touch within one lattice cell near (%zu,%zu,%zu). Use lanier_full or a future nested/contact formulation instead.",
+                    (unsigned)m+1,(unsigned)q+1,x,y,z);
+            }
+        }
+    }
+    free(occ);
+}
+
+static void PartitionBuildExcitation(const int active,const doublecomplex *E0,
+                                     const doublecomplex *scat,const int *mats,const int nm,
+                                     const size_t nrows)
+{
+    size_t i; int k;
+    (void)nrows;
+    for(i=0;i<local_nvoid_Ndip;i++) {
+        const size_t p=3*i;
+        if((int)material[i]!=active) {
+            Einc[p]=Einc[p+1]=Einc[p+2]=0;
+            continue;
+        }
+        for(int c=0;c<3;c++) {
+            doublecomplex e=E0[p+(size_t)c];
+            for(k=0;k<nm;k++) if(mats[k]!=active)
+                e += scat[(size_t)k*nrows+p+(size_t)c];
+            Einc[p+(size_t)c]=e;
+        }
+    }
+}
+
+static int PartitionMaterialSlot(const int *mats,const int nm,const int mat)
+{
+    int k; for(k=0;k<nm;k++) if(mats[k]==mat) return k;
+    return -1;
+}
+
+static int LanierPartitionLocalSolve(const int active,const int slot,const int *mats,const int nm,
+                                     const doublecomplex *E0,doublecomplex *combined,doublecomplex *scat,
+                                     const size_t nrows,const enum iter method_in,const enum incpol which)
+{
+    size_t i; int its; const bool save_lp=lanier_precon,save_lf=lanier_full_precon;
+    const bool save_local=lanier_partition_local_mode,save_warm=lanier_partition_use_existing_x;
+    const int save_active=lanier_partition_active_material;
+
+    PartitionBuildExcitation(active,E0,scat,mats,nm,nrows);
+    /* Warm start only with this object's previous transformed solution. */
+    for(i=0;i<local_nvoid_Ndip;i++) {
+        const size_t p=3*i;
+        if((int)material[i]==active) {
+            xvec[p]=combined[p];xvec[p+1]=combined[p+1];xvec[p+2]=combined[p+2];
+        } else xvec[p]=xvec[p+1]=xvec[p+2]=0;
+    }
+
+    lanier_partition_local_mode=true;
+    lanier_partition_active_material=active;
+    lanier_partition_use_existing_x=true;
+    lanier_precon=true;
+    lanier_full_precon=true;
+    CudaLanierPartitionProjection(active);
+    if(IFROOT) PrintBoth(logfile,"LANIER_PARTITION: solve material %d with %s + regional FULL6, warm-start enabled.\n",
+                           active+1,LanierMethodName(method_in));
+    its=IterativeSolverCore(method_in,which);
+    CudaLanierPartitionProjection(-1);
+    if(its==CHP_EXIT) LogError(ONE_POS,"Checkpoints are not supported inside LANIER_PARTITION regional sweeps");
+
+    /* xvec is the transformed regional solution. Update the combined vector. */
+    for(i=0;i<local_nvoid_Ndip;i++) if((int)material[i]==active) {
+        const size_t p=3*i;
+        combined[p]=xvec[p];combined[p+1]=xvec[p+1];combined[p+2]=xvec[p+2];
+    }
+
+    /* Full, unprojected field from this object. For A~=I+SDS and p=S*y,
+     * E_scat=-D*p=S^-1(y-A~y). */
+    MatVec(xvec,Avecbuffer,NULL,false,&Timing_MVP,&Timing_MVPComm);
+    for(i=0;i<local_nvoid_Ndip;i++) {
+        const size_t p=3*i,tm=(size_t)material[i];
+        for(int c=0;c<3;c++)
+            scat[(size_t)slot*nrows+p+(size_t)c]=(xvec[p+(size_t)c]-Avecbuffer[p+(size_t)c])/
+                                                     cc_sqrt[tm][c];
+    }
+
+    lanier_precon=save_lp;lanier_full_precon=save_lf;
+    lanier_partition_local_mode=save_local;
+    lanier_partition_active_material=save_active;
+    lanier_partition_use_existing_x=save_warm;
+    return its;
+}
+
+static double PartitionGlobalResidual(const doublecomplex *E0,doublecomplex *combined,const size_t nrows)
+{
+    double b2,r2;
+    memcpy(Einc,E0,nrows*sizeof(doublecomplex));
+    memcpy(xvec,combined,nrows*sizeof(doublecomplex));
+    nMult_mat(pvec,Einc,cc_sqrt);
+    b2=nNorm2(pvec,&Timing_IntFieldOneComm);
+    r2=ResidualNorm2(xvec,rvec,Avecbuffer,&Timing_MVP,&Timing_MVPComm,&Timing_IntFieldOneComm);
+    return b2>0 ? sqrt(r2/b2) : HUGE_VAL;
+}
+
+static int LanierPartitionSolver(const enum iter method_in,const enum incpol which)
+{
+    const size_t nrows=3*local_nvoid_Ndip;
+    int mats[MAX_NMAT],nm=0,m,k,sweep,final_its;
+    int max_sweeps=PartitionEnvInt("ADDA_LANIER_PARTITION_MAX_SWEEPS",50,1,10000);
+    double part_tol=PartitionEnvDouble("ADDA_LANIER_PARTITION_TOL",iter_eps);
+    doublecomplex *E0,*combined,*prev,*scat;
+    size_t start_total=TotalIter;
+    double rel_change=HUGE_VAL,global_resid=HUGE_VAL;
+    const bool save_lp=lanier_precon,save_lf=lanier_full_precon;
+    const bool save_local=lanier_partition_local_mode,save_warm=lanier_partition_use_existing_x;
+    const int save_active=lanier_partition_active_material;
+
+    if(Nmat<2) LogError(ONE_POS,"LANIER_PARTITION requires at least two material domains");
+    if(surface) LogError(ONE_POS,"LANIER_PARTITION does not support -surf");
+    if(rectDip) LogError(ONE_POS,"LANIER_PARTITION currently requires cubic voxels");
+    if(load_chpoint || chp_type!=CHP_NONE)
+        LogError(ONE_POS,"LANIER_PARTITION V2 does not support loading/saving iterative checkpoints");
+    PartitionRejectTouchingMaterials();
+    for(m=0;m<Nmat;m++) {
+        bool found=false; size_t i;
+        for(i=0;i<local_nvoid_Ndip;i++) if((int)material[i]==m){found=true;break;}
+        if(found) mats[nm++]=m;
+    }
+    if(nm<2) LogError(ONE_POS,"LANIER_PARTITION found fewer than two occupied material regions");
+
+    E0=(doublecomplex*)malloc(nrows*sizeof(doublecomplex));
+    combined=(doublecomplex*)calloc(nrows,sizeof(doublecomplex));
+    prev=(doublecomplex*)malloc(nrows*sizeof(doublecomplex));
+    if((size_t)nm>SIZE_MAX/nrows || (size_t)nm*nrows>SIZE_MAX/sizeof(doublecomplex))
+        LogError(ONE_POS,"LANIER_PARTITION scattered-field allocation overflow");
+    scat=(doublecomplex*)calloc((size_t)nm*nrows,sizeof(doublecomplex));
+    if(E0==NULL||combined==NULL||prev==NULL||scat==NULL) {
+        free(E0);free(combined);free(prev);free(scat);
+        LogError(ONE_POS,"Insufficient host memory for LANIER_PARTITION work vectors");
+    }
+    memcpy(E0,Einc,nrows*sizeof(doublecomplex));
+
+    if(IFROOT) PrintBoth(logfile,
+        "LANIER_PARTITION V2: %d separated material regions; regional solver=%s+FULL6; final solver=%s; max_roundtrips=%d; partition_tol="GFORM".\n"
+        "LANIER_PARTITION V2 uses the -iter solver for every regional solve and the final full-system solve. One regional cuFFT conditioner is resident at a time; regional GPU-plan caching is deferred.\n",
+        nm,LanierMethodName(method_in),LanierMethodName(method_in),max_sweeps,part_tol);
+
+    lanier_partition_internal_call=true;
+    /* First forward pass: incident field -> object 1 -> object 2 -> ... */
+    for(k=0;k<nm;k++) {
+        const int slot=PartitionMaterialSlot(mats,nm,mats[k]);
+        LanierPartitionLocalSolve(mats[k],slot,mats,nm,E0,combined,scat,nrows,method_in,which);
+    }
+    global_resid=PartitionGlobalResidual(E0,combined,nrows);
+    if(IFROOT) PrintBoth(logfile,"LANIER_PARTITION initial forward pass: full physical residual="EFORM".\n",global_resid);
+
+    for(sweep=1;sweep<=max_sweeps && global_resid>iter_eps;sweep++) {
+        memcpy(prev,combined,nrows*sizeof(doublecomplex));
+        /* Reverse pass excludes the last object already solved at the end of
+         * the forward pass; forward pass excludes object 0 solved at reverse end. */
+        for(k=nm-2;k>=0;k--) {
+            const int slot=PartitionMaterialSlot(mats,nm,mats[k]);
+            LanierPartitionLocalSolve(mats[k],slot,mats,nm,E0,combined,scat,nrows,method_in,which);
+        }
+        for(k=1;k<nm;k++) {
+            const int slot=PartitionMaterialSlot(mats,nm,mats[k]);
+            LanierPartitionLocalSolve(mats[k],slot,mats,nm,E0,combined,scat,nrows,method_in,which);
+        }
+        rel_change=PartitionRelChange(combined,prev,nrows);
+        global_resid=PartitionGlobalResidual(E0,combined,nrows);
+        if(IFROOT) PrintBoth(logfile,
+            "LANIER_PARTITION roundtrip %d: relative solution change="EFORM", full physical residual="EFORM".\n",
+            sweep,rel_change,global_resid);
+        if(rel_change<=part_tol) {
+            if(IFROOT) PrintBoth(logfile,"LANIER_PARTITION regional fixed point reached at roundtrip %d.\n",sweep);
+            break;
+        }
+    }
+
+    /* Fig. 3: Combine Solutions -> Solve Full Problem. Use the combined
+     * transformed solution as x0 for the user's selected final solver, with
+     * the physical full operator and no single global Lanier conditioner. */
+    memcpy(Einc,E0,nrows*sizeof(doublecomplex));
+    memcpy(xvec,combined,nrows*sizeof(doublecomplex));
+    CudaLanierPartitionProjection(-1);
+    lanier_partition_local_mode=false;
+    lanier_partition_active_material=-1;
+    lanier_precon=false;
+    lanier_full_precon=false;
+    lanier_partition_use_existing_x=true;
+    if(IFROOT) PrintBoth(logfile,
+        "LANIER_PARTITION: Combine Solutions -> Solve Full Problem with %s warm start; preconditioner=none.\n",
+        LanierMethodName(method_in));
+    final_its=IterativeSolverCore(method_in,which);
+
+    if(IFROOT) PrintBoth(logfile,
+        "LANIER_PARTITION summary: regional+final Krylov iterations=%zu; final full-solve iterations=%d; last partition residual="EFORM".\n",
+        TotalIter-start_total,final_its,global_resid);
+
+    lanier_precon=save_lp;lanier_full_precon=save_lf;
+    lanier_partition_local_mode=save_local;
+    lanier_partition_active_material=save_active;
+    lanier_partition_use_existing_x=save_warm;
+    lanier_partition_internal_call=false;
+    free(E0);free(combined);free(prev);free(scat);
+    return final_its;
+}
+#endif /* ADDA_CUDA */
+
+int IterativeSolver(const enum iter method_in,const enum incpol which)
+{
+#ifdef ADDA_CUDA
+    if(lanier_partition_precon && !lanier_partition_internal_call)
+        return LanierPartitionSolver(method_in,which);
+#else
+    if(lanier_partition_precon)
+        LogError(ONE_POS,"LANIER_PARTITION requires an ADDA CUDA executable");
+#endif
+    return IterativeSolverCore(method_in,which);
 }

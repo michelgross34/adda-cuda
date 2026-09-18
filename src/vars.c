@@ -89,6 +89,18 @@ unsigned char * restrict material;  // material: index for cc
 // iterative solver
 enum iter IterMethod; // iterative method to use
 int maxiter;          // maximum number of iterations
+bool lanier_precon;   // any Lanier right preconditioner (CUDA BCGS2)
+bool lanier_full_precon; // TQC-v1 FULL6 path; reference modes remain unchanged
+bool lanier_partition_precon; // partitioned multi-material Lanier pre-solve for separated regions
+bool lanier_nested_precon; // block-Jacobi multi-material FULL6 preconditioner for touching/nested regions
+bool lanier_multizone_precon; // N-zone strict-mask FULL6 block preconditioner; one ADDA domain per zone
+bool lanier_multizone_schwarz_precon; // multiplicative Schwarz / forward block-Gauss-Seidel multizone mode
+bool lanier_multizone_schwarz_sym_precon; // forward+backward regional sweep
+bool lanier_multizone_schwarz_reverse_precon; // reverse multiplicative Schwarz: descending ADDA-domain order
+bool lanier_multizone_schur_precon; // nearest-neighbor approximate Schur-LDU multizone mode
+bool lanier_partition_local_mode; // internal: local material subproblem currently active
+int lanier_partition_active_material; // internal: material index of current local subproblem
+double lanier_expansion; // 1.0 or 1.5; meaningful when lanier_precon=true
 	// the following two can't be declared restrict due to SwapPointers
 doublecomplex *xvec;  // total electric field at the voxel centers
 doublecomplex *pvec;  // voxel polarizations, also an auxiliary vector in iterative solvers

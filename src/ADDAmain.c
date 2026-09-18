@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+
 /* When linking both C and Fortran code under Windows, using gcc 4.6.1, EOL style in both stdout and stderr becomes that
  * of Unix. Probably this is due to automatic change of write mode for this streams to binary by gfortran (even when
  * Fortran code has nothing to do with i/o at all). The same may happen to stdin, but this is hard to test.

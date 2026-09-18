@@ -1487,6 +1487,20 @@ void InitShape(void)
 			Nmat_need=1;
 			break;
 		}
+		case SH_BISPHERE2: {
+			double diskratio=sh_pars[0];
+			if (!(diskratio>1.0)) LogError(ONE_POS,"bisphere2 requires R_cc/d > 1 so the two material regions are separated");
+			if (IFROOT) {
+				sh_form_str1="bisphere2 (two materials); diameter(d):";
+				sh_form_str2=dyn_sprintf(", center-center distance R_cc/d="GFORM,diskratio);
+			}
+			hdratio=diskratio/2.0;
+			volume_ratio=2*PI_OVER_SIX;
+			yx_ratio=1;
+			zx_ratio=diskratio+1;
+			Nmat_need=2;
+			break;
+		}
 		case SH_BOX: {
 			if (sh_Npars==0) {
 				if (IFROOT) sh_form_str1="cube; size of edge along x-axis:";
@@ -2216,6 +2230,13 @@ void MakeParticle(void)
 				if (ro2<=0.25) {
 					tmp1=fabs(zr)-hdratio;
 					if (tmp1*tmp1+ro2<=0.25) mat=0;
+				}
+				break;
+			case SH_BISPHERE2:
+				ro2=xr*xr+yr*yr;
+				if (ro2<=0.25) {
+					if (zr<0) { tmp1=zr+hdratio; if (tmp1*tmp1+ro2<=0.25) mat=0; }
+					else { tmp1=zr-hdratio; if (tmp1*tmp1+ro2<=0.25) mat=1; }
 				}
 				break;
 			case SH_BOX:

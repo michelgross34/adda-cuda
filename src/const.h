@@ -169,6 +169,7 @@ enum sh { // shape types
 	SH_BICOATED,      // two coated spheres
 	SH_BIELLIPSOID,   // two general ellipsoids
 	SH_BISPHERE,      // two spheres
+	SH_BISPHERE2,     // two separated spheres, one material per sphere
 	SH_BOX,           // box (may be rectangular)
 	SH_CAPSULE,       // capsule
 	SH_CHEBYSHEV,     // Chebyshev particle (axisymmetric)
@@ -265,7 +266,9 @@ enum iter { // iterative methods
 	IT_GPBICGSTAB2, // Generalized Product-type BiCGStab(2)
 	IT_GPBICGSTAB4, // Generalized Product-type BiCGStab(4) (CPU implementation)
 	IT_QMR_CS,   // Quasi-minimal residual for Complex-Symmetric matrices
-	IT_QMR_CS_2  // 2-term QMR (better roundoff properties)
+	IT_QMR_CS_2, // 2-term QMR (better roundoff properties)
+	IT_BICGSTAB8, // BiCGStab(L) with L=8; appended to preserve existing solver enum IDs
+	IT_BICGSTAB12  // BiCGStab(L) with L=12; appended to preserve existing solver enum IDs
 	/* TO ADD NEW ITERATIVE SOLVER
 	 * add an identifier starting with 'IT_' and a descriptive comment to this list in the alphabetical order.
 	 */

@@ -20,6 +20,7 @@
 #include <cufft.h>
 #include <cublas_v2.h>
 #include <cuComplex.h>
+#include "kernel.h"
 
 #include <cerrno>
 #include <climits>
@@ -237,47 +238,29 @@ struct Context {
 Context g;
 char g_error[512] = {0};
 
-__host__ __device__ inline cuDoubleComplex cmul(const cuDoubleComplex a, const cuDoubleComplex b)
-{
-    return make_cuDoubleComplex(a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x);
-}
+/* cmul moved to kernel.cu */
 
-__host__ __device__ inline cuDoubleComplex cadd_hd(const cuDoubleComplex a, const cuDoubleComplex b)
-{
-    return make_cuDoubleComplex(a.x + b.x, a.y + b.y);
-}
 
-__host__ __device__ inline cuDoubleComplex csub_hd(const cuDoubleComplex a, const cuDoubleComplex b)
-{
-    return make_cuDoubleComplex(a.x - b.x, a.y - b.y);
-}
+/* cadd_hd moved to kernel.cu */
 
-__host__ __device__ inline cuDoubleComplex cscale_hd(const cuDoubleComplex a, const AddaCudaReal s)
-{
-    return make_cuDoubleComplex(a.x*s,a.y*s);
-}
 
-__host__ __device__ inline cuDoubleComplex cdiv_hd(const cuDoubleComplex a, const cuDoubleComplex b)
-{
-    const AddaCudaReal den=b.x*b.x+b.y*b.y;
-    return make_cuDoubleComplex((a.x*b.x+a.y*b.y)/den,
-                                (a.y*b.x-a.x*b.y)/den);
-}
+/* csub_hd moved to kernel.cu */
 
-__host__ __device__ inline AddaCudaReal cabs2_hd(const cuDoubleComplex a)
-{
-    return a.x*a.x+a.y*a.y;
-}
 
-__host__ __device__ inline cuDoubleComplex cneg_hd(const cuDoubleComplex a)
-{
-    return make_cuDoubleComplex(-a.x, -a.y);
-}
+/* cscale_hd moved to kernel.cu */
 
-__host__ __device__ inline cuDoubleComplex cconj_hd(const cuDoubleComplex a)
-{
-    return make_cuDoubleComplex(a.x, -a.y);
-}
+
+/* cdiv_hd moved to kernel.cu */
+
+
+/* cabs2_hd moved to kernel.cu */
+
+
+/* cneg_hd moved to kernel.cu */
+
+
+/* cconj_hd moved to kernel.cu */
+
 
 void setError(const char *msg)
 {
@@ -527,173 +510,20 @@ cuDoubleComplex *iterDeviceVector(const void *host_id)
     return nullptr;
 }
 
-__global__ void scatterKernel(const cuDoubleComplex *arg,
-                              cuDoubleComplex *grid,
-                              const unsigned char *material,
-                              const unsigned short *position,
-                              const cuDoubleComplex *cc,
-                              size_t ndip,
-                              size_t gridX,
-                              size_t gridY,
-                              size_t gridN,
-                              int her)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i >= ndip) return;
+/* scatterKernel moved to kernel.cu */
 
-    const size_t p = 3 * i;
-    const size_t x = position[p];
-    const size_t y = position[p + 1];
-    const size_t z = position[p + 2];
-    const size_t index = (z * gridY + y) * gridX + x;
-    const size_t mat = material[i];
 
-#pragma unroll
-    for (int c = 0; c < 3; ++c) {
-        cuDoubleComplex a = arg[p + static_cast<size_t>(c)];
-        if (her) a = cconj_hd(a);
-        grid[static_cast<size_t>(c) * gridN + index] =
-            cmul(cc[3 * mat + static_cast<size_t>(c)], a);
-    }
-}
+/* symMatVec moved to kernel.cu */
 
-__device__ inline void symMatVec(const cuDoubleComplex f[6],
-                                 const cuDoubleComplex x[3],
-                                 cuDoubleComplex y[3])
-{
-    y[0] = cadd_hd(cadd_hd(cmul(f[0],x[0]), cmul(f[1],x[1])), cmul(f[2],x[2]));
-    y[1] = cadd_hd(cadd_hd(cmul(f[1],x[0]), cmul(f[3],x[1])), cmul(f[4],x[2]));
-    y[2] = cadd_hd(cadd_hd(cmul(f[2],x[0]), cmul(f[4],x[1])), cmul(f[5],x[2]));
-}
 
-__device__ inline void reflMatVec(const cuDoubleComplex f[6],
-                                  const cuDoubleComplex x[3],
-                                  cuDoubleComplex y[3])
-{
-    y[0] = cadd_hd(cadd_hd(cmul(f[0],x[0]), cmul(f[1],x[1])), cmul(f[2],x[2]));
-    y[1] = cadd_hd(cadd_hd(cmul(f[1],x[0]), cmul(f[3],x[1])), cmul(f[4],x[2]));
-    y[2] = cadd_hd(cadd_hd(cneg_hd(cmul(f[2],x[0])), cneg_hd(cmul(f[4],x[1]))), cmul(f[5],x[2]));
-}
+/* reflMatVec moved to kernel.cu */
 
-__global__ void spectralMultiplyKernel(cuDoubleComplex *grid,
-                                       const cuDoubleComplex *gridR,
-                                       const cuDoubleComplex *D,
-                                       const cuDoubleComplex *R,
-                                       size_t gridX,
-                                       size_t gridY,
-                                       size_t gridZ,
-                                       size_t gridN,
-                                       size_t DsizeY,
-                                       size_t DsizeZ,
-                                       size_t RsizeY,
-                                       int reduced,
-                                       int transposed,
-                                       int surface)
-{
-    const size_t index = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (index >= gridN) return;
 
-    const size_t x0 = index % gridX;
-    const size_t yz = index / gridX;
-    const size_t y0 = yz % gridY;
-    const size_t z0 = yz / gridY;
+/* spectralMultiplyKernel moved to kernel.cu */
 
-    cuDoubleComplex xv[3], yv[3], f[6];
-#pragma unroll
-    for (int c=0; c<3; ++c) xv[c] = grid[static_cast<size_t>(c)*gridN + index];
 
-    size_t x=x0, y=y0, z=z0;
-    if (transposed) {
-        if (x>0) x=gridX-x;
-        if (y>0) y=gridY-y;
-        if (z>0) z=gridZ-z;
-    }
-    else {
-        if (y>=DsizeY) y=gridY-y;
-        if (z>=DsizeZ) z=gridZ-z;
-    }
-    const size_t dbase = 6 * ((x*DsizeZ + z)*DsizeY + y);
-#pragma unroll
-    for (int k=0; k<6; ++k) f[k]=D[dbase + static_cast<size_t>(k)];
+/* gatherKernel moved to kernel.cu */
 
-    if (reduced) {
-        if (y0>=DsizeY) {
-            f[1]=cneg_hd(f[1]);
-            if (z0>=DsizeZ) f[2]=cneg_hd(f[2]);
-            else f[4]=cneg_hd(f[4]);
-        }
-        else if (z0>=DsizeZ) {
-            f[2]=cneg_hd(f[2]);
-            f[4]=cneg_hd(f[4]);
-        }
-    }
-    symMatVec(f,xv,yv);
-
-    if (surface) {
-        cuDoubleComplex xr[3], yr[3];
-#pragma unroll
-        for (int c=0; c<3; ++c) xr[c] = gridR[static_cast<size_t>(c)*gridN + index];
-
-        x=x0; y=y0; z=z0;
-        if (transposed) {
-            if (x>0) x=gridX-x;
-            if (y>0) y=gridY-y;
-        }
-        else if (y>=RsizeY) y=gridY-y;
-
-        const size_t rbase = 6 * ((x*gridZ + z)*RsizeY + y);
-#pragma unroll
-        for (int k=0; k<6; ++k) f[k]=R[rbase + static_cast<size_t>(k)];
-        if (reduced && y0>=RsizeY) {
-            f[1]=cneg_hd(f[1]);
-            f[4]=cneg_hd(f[4]);
-        }
-        if (transposed) {
-            f[2]=cneg_hd(f[2]);
-            f[4]=cneg_hd(f[4]);
-        }
-        reflMatVec(f,xr,yr);
-#pragma unroll
-        for (int c=0; c<3; ++c) yv[c]=cadd_hd(yv[c],yr[c]);
-    }
-
-#pragma unroll
-    for (int c=0; c<3; ++c) grid[static_cast<size_t>(c)*gridN + index]=yv[c];
-}
-
-__global__ void gatherKernel(const cuDoubleComplex *arg,
-                             cuDoubleComplex *result,
-                             const cuDoubleComplex *grid,
-                             const unsigned char *material,
-                             const unsigned short *position,
-                             const cuDoubleComplex *cc,
-                             size_t ndip,
-                             size_t gridX,
-                             size_t gridY,
-                             size_t gridN,
-                             int her)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i >= ndip) return;
-
-    const size_t p = 3 * i;
-    const size_t x = position[p];
-    const size_t y = position[p + 1];
-    const size_t z = position[p + 2];
-    const size_t index = (z * gridY + y) * gridX + x;
-    const size_t mat = material[i];
-
-#pragma unroll
-    for (int c=0; c<3; ++c) {
-        cuDoubleComplex a = arg[p + static_cast<size_t>(c)];
-        if (her) a = cconj_hd(a);
-        cuDoubleComplex r = cadd_hd(a,
-            cmul(cc[3*mat + static_cast<size_t>(c)],
-                 grid[static_cast<size_t>(c)*gridN + index]));
-        if (her) r = cconj_hd(r);
-        result[p + static_cast<size_t>(c)] = r;
-    }
-}
 
 
 
@@ -704,365 +534,86 @@ __global__ void gatherKernel(const cuDoubleComplex *arg,
  * 1/N inverse-FFT normalization.  CUDA only scatters, FFTs, multiplies by the
  * reduced inverse spectrum, inverse FFTs, and gathers.
  */
-__global__ void lanierBoxScatterKernel(const cuDoubleComplex *arg,
-                                       cuDoubleComplex *grid,
-                                       const unsigned short *position,
-                                       size_t ndip,size_t nx,size_t ny,size_t n)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(i>=ndip) return;
-    const size_t p=3*i;
-    const size_t index=(static_cast<size_t>(position[p+2])*ny+position[p+1])*nx+position[p];
-#pragma unroll
-    for(int c=0;c<3;c++) grid[static_cast<size_t>(c)*n+index]=arg[p+static_cast<size_t>(c)];
-}
+/* lanierBoxScatterKernel moved to kernel.cu */
 
-__global__ void lanierBoxGatherKernel(const cuDoubleComplex *grid,
-                                      cuDoubleComplex *out,
-                                      const unsigned short *position,
-                                      size_t ndip,size_t nx,size_t ny,size_t n)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(i>=ndip) return;
-    const size_t p=3*i;
-    const size_t index=(static_cast<size_t>(position[p+2])*ny+position[p+1])*nx+position[p];
-#pragma unroll
-    for(int c=0;c<3;c++) out[p+static_cast<size_t>(c)]=grid[static_cast<size_t>(c)*n+index];
-}
+
+/* lanierBoxGatherKernel moved to kernel.cu */
+
 
 /* LANIER_FULL uses the DDSCAT lattice-unit circulant M_hat ~= alpha_opt^-1-G_hat.
  * ADDA solves a symmetrically transformed system. With alpha_hat=cc/dipvol,
  * the corresponding right preconditioner is P=S_hat^-1 M_hat^-1 S_hat^-1,
  * S_hat=sqrt(alpha_hat). These kernels therefore multiply each 1/cc_sqrt by
  * sqrt(dipvol), without modifying the validated reference Lanier path. */
-__global__ void lanierFullBoxScatterKernel(const cuDoubleComplex *arg,
-                                           cuDoubleComplex *grid,
-                                           const unsigned short *position,
-                                           const unsigned char *material,
-                                           const cuDoubleComplex *cc,
-                                           size_t ndip,size_t nx,size_t ny,size_t n,AddaCudaReal sqrt_dipvol,
-                                           int active_material,size_t x0,size_t y0,size_t z0)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(i>=ndip) return;
-    const size_t mat=material[i];
-    if(active_material>=0 && mat!=static_cast<size_t>(active_material)) return;
-    const size_t p=3*i;
-    const size_t gx=position[p],gy=position[p+1],gz=position[p+2];
-    if(gx<x0 || gy<y0 || gz<z0) return;
-    const size_t lx=gx-x0,ly=gy-y0,lz=gz-z0;
-    if(lx>=nx || ly>=ny) return;
-    const size_t index=(lz*ny+ly)*nx+lx;
-    if(index>=n) return;
-#pragma unroll
-    for(int c=0;c<3;c++) {
-        cuDoubleComplex v=cdiv_hd(arg[p+static_cast<size_t>(c)],cc[3*mat+static_cast<size_t>(c)]);
-        grid[static_cast<size_t>(c)*n+index]=make_cuDoubleComplex(v.x*sqrt_dipvol,v.y*sqrt_dipvol);
-    }
-}
+/* lanierFullBoxScatterKernel moved to kernel.cu */
 
-__global__ void lanierFullBoxGatherKernel(const cuDoubleComplex *grid,
-                                          cuDoubleComplex *out,
-                                          const unsigned short *position,
-                                          const unsigned char *material,
-                                          const cuDoubleComplex *cc,
-                                          size_t ndip,size_t nx,size_t ny,size_t n,AddaCudaReal sqrt_dipvol,
-                                          int active_material,size_t x0,size_t y0,size_t z0)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(i>=ndip) return;
-    const size_t p=3*i;
-    const size_t mat=material[i];
-    if(active_material>=0 && mat!=static_cast<size_t>(active_material)) {
-#pragma unroll
-        for(int c=0;c<3;c++) out[p+static_cast<size_t>(c)]=make_cuDoubleComplex(0,0);
-        return;
-    }
-    const size_t gx=position[p],gy=position[p+1],gz=position[p+2];
-    if(gx<x0 || gy<y0 || gz<z0) {
-#pragma unroll
-        for(int c=0;c<3;c++) out[p+static_cast<size_t>(c)]=make_cuDoubleComplex(0,0);
-        return;
-    }
-    const size_t lx=gx-x0,ly=gy-y0,lz=gz-z0;
-    const size_t index=(lz*ny+ly)*nx+lx;
-    if(lx>=nx || ly>=ny || index>=n) {
-#pragma unroll
-        for(int c=0;c<3;c++) out[p+static_cast<size_t>(c)]=make_cuDoubleComplex(0,0);
-        return;
-    }
-#pragma unroll
-    for(int c=0;c<3;c++) {
-        cuDoubleComplex v=cdiv_hd(grid[static_cast<size_t>(c)*n+index],cc[3*mat+static_cast<size_t>(c)]);
-        out[p+static_cast<size_t>(c)]=make_cuDoubleComplex(v.x*sqrt_dipvol,v.y*sqrt_dipvol);
-    }
-}
+
+/* lanierFullBoxGatherKernel moved to kernel.cu */
+
 
 /* Project a compact physical MatVec result onto one material partition. */
-__global__ void materialProjectionKernel(cuDoubleComplex *v,const unsigned char *material,
-                                         size_t ndip,int active_material)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(i>=ndip || material[i]==static_cast<unsigned char>(active_material)) return;
-    const size_t p=3*i;
-    v[p]=v[p+1]=v[p+2]=make_cuDoubleComplex(0,0);
-}
+/* materialProjectionKernel moved to kernel.cu */
 
-__global__ void lanierReducedMultiplyKernel(cuDoubleComplex *grid,
-                                            const cuDoubleComplex *coef,
-                                            size_t nx,size_t ny,size_t nz,size_t n,
-                                            size_t rx,size_t ry,size_t rz,size_t nred)
-{
-    const size_t index=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if(index>=n) return;
-    const size_t x=index%nx, yz=index/nx, y=yz%ny, z=yz/ny;
-    const bool xr=x>nx/2, yr=y>ny/2, zr=z>nz/2;
-    const size_t mx=xr ? nx-x : x;
-    const size_t my=yr ? ny-y : y;
-    const size_t mz=zr ? nz-z : z;
-    const size_t ridx=(mx*ry+my)*rz+mz;
-    (void)rx;
-    const AddaCudaReal sxy=(xr^yr) ? static_cast<AddaCudaReal>(-1) : static_cast<AddaCudaReal>(1);
-    const AddaCudaReal sxz=(xr^zr) ? static_cast<AddaCudaReal>(-1) : static_cast<AddaCudaReal>(1);
-    const AddaCudaReal syz=(yr^zr) ? static_cast<AddaCudaReal>(-1) : static_cast<AddaCudaReal>(1);
-    cuDoubleComplex m[6],v[3],w[3];
-    m[0]=coef[0*nred+ridx];
-    m[1]=cscale_hd(coef[1*nred+ridx],sxy);
-    m[2]=cscale_hd(coef[2*nred+ridx],sxz);
-    m[3]=coef[3*nred+ridx];
-    m[4]=cscale_hd(coef[4*nred+ridx],syz);
-    m[5]=coef[5*nred+ridx];
-#pragma unroll
-    for(int c=0;c<3;c++) v[c]=grid[static_cast<size_t>(c)*n+index];
-    symMatVec(m,v,w);
-#pragma unroll
-    for(int c=0;c<3;c++) grid[static_cast<size_t>(c)*n+index]=w[c];
-}
+
+/* lanierReducedMultiplyKernel moved to kernel.cu */
+
 /* --------------------------- Slice FFT MatVec --------------------------- */
-__global__ void scatterSliceKernel(const cuDoubleComplex *arg, cuDoubleComplex *slice,
-                                   const unsigned char *material, const unsigned short *position,
-                                   const cuDoubleComplex *cc, size_t ndip, size_t boxX, size_t boxY,
-                                   size_t sliceN, int her)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if (i>=ndip) return;
-    const size_t p=3*i, x=position[p], y=position[p+1], z=position[p+2];
-    const size_t index=z*(boxX*boxY)+y*boxX+x, mat=material[i];
-#pragma unroll
-    for (int c=0;c<3;++c) {
-        cuDoubleComplex a=arg[p+static_cast<size_t>(c)];
-        if (her) a=cconj_hd(a);
-        slice[static_cast<size_t>(c)*sliceN+index]=cmul(cc[3*mat+static_cast<size_t>(c)],a);
-    }
-}
+/* scatterSliceKernel moved to kernel.cu */
 
-__global__ void sliceToPlaneBatchKernel(const cuDoubleComplex *slice, cuDoubleComplex *plane,
-                                        size_t kz0, size_t activeSlices,
-                                        size_t boxX, size_t boxY, size_t gridX,
-                                        size_t boxXY, size_t sliceN, size_t planeN)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    const size_t batchPlaneN=static_cast<size_t>(ADDA_CUDA_SLICE_BATCH)*planeN;
-    if (i>=batchPlaneN) return;
-    const size_t b=i/planeN;
-    const size_t local=i-b*planeN;
-    const size_t x=local%gridX, y=local/gridX;
-    const bool valid=(b<activeSlices && x<boxX && y<boxY);
-    const size_t src=valid ? (kz0+b)*boxXY+y*boxX+x : 0;
-#pragma unroll
-    for (int c=0;c<3;++c) {
-        const size_t dst=(b*3+static_cast<size_t>(c))*planeN+local;
-        plane[dst]=valid ? slice[static_cast<size_t>(c)*sliceN+src]
-                         : make_cuDoubleComplex(0.0,0.0);
-    }
-}
 
-__global__ void spectralMultiplySliceBatchKernel(cuDoubleComplex *plane, const cuDoubleComplex *D,
-                                                 size_t kz0, size_t activeSlices,
-                                                 size_t gridX, size_t gridY, size_t gridZ,
-                                                 size_t planeN, size_t DsizeX, size_t DsizeY, size_t DsizeZ,
-                                                 int reduced, int transposed, int lowMemGreen)
-{
-    const size_t index=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    const size_t activeN=activeSlices*planeN;
-    if (index>=activeN) return;
-    const size_t b=index/planeN;
-    const size_t local=index-b*planeN;
-    const size_t x0=local%gridX, y0=local/gridX, z0=kz0+b;
-    cuDoubleComplex xv[3],yv[3],f[6];
-#pragma unroll
-    for (int c=0;c<3;++c)
-        xv[c]=plane[(b*3+static_cast<size_t>(c))*planeN+local];
-    size_t x=x0,y=y0,z=z0;
-    bool rx=false,ry=false,rz=false;
-    if (transposed) {
-        if (x>0) x=gridX-x;
-        if (y>0) y=gridY-y;
-        if (z>0) z=gridZ-z;
-    } else {
-        if (lowMemGreen && x>=DsizeX) { x=gridX-x; rx=true; }
-        if (y>=DsizeY) { y=gridY-y; ry=true; }
-        if (z>=DsizeZ) { z=gridZ-z; rz=true; }
-    }
-    const size_t dbase=6*((x*DsizeZ+z)*DsizeY+y);
-#pragma unroll
-    for (int j=0;j<6;++j) f[j]=D[dbase+static_cast<size_t>(j)];
-    if (reduced) {
-        /* G=A I+B rr is even on diagonal and changes sign on an off-diagonal
-         * component iff exactly one of its coordinate axes is reflected.
-         * Component order is xx,xy,xz,yy,yz,zz. */
-        if (rx != ry) f[1]=cneg_hd(f[1]);
-        if (rx != rz) f[2]=cneg_hd(f[2]);
-        if (ry != rz) f[4]=cneg_hd(f[4]);
-    }
-    symMatVec(f,xv,yv);
-#pragma unroll
-    for (int c=0;c<3;++c)
-        plane[(b*3+static_cast<size_t>(c))*planeN+local]=yv[c];
-}
+/* sliceToPlaneBatchKernel moved to kernel.cu */
 
-__global__ void planeToSliceBatchKernel(const cuDoubleComplex *plane, cuDoubleComplex *slice,
-                                        size_t kz0, size_t activeSlices,
-                                        size_t boxX, size_t gridX, size_t boxXY,
-                                        size_t sliceN, size_t planeN)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    const size_t activeN=activeSlices*boxXY;
-    if (i>=activeN) return;
-    const size_t b=i/boxXY;
-    const size_t local=i-b*boxXY;
-    const size_t x=local%boxX, y=local/boxX;
-    const size_t src=y*gridX+x, dst=(kz0+b)*boxXY+local;
-#pragma unroll
-    for (int c=0;c<3;++c)
-        slice[static_cast<size_t>(c)*sliceN+dst]=plane[(b*3+static_cast<size_t>(c))*planeN+src];
-}
 
-__global__ void gatherSliceKernel(const cuDoubleComplex *arg, cuDoubleComplex *result,
-                                  const cuDoubleComplex *slice, const unsigned char *material,
-                                  const unsigned short *position, const cuDoubleComplex *cc,
-                                  size_t ndip, size_t boxX, size_t boxY, size_t sliceN, int her)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if (i>=ndip) return;
-    const size_t p=3*i, x=position[p], y=position[p+1], z=position[p+2];
-    const size_t index=z*(boxX*boxY)+y*boxX+x, mat=material[i];
-#pragma unroll
-    for (int c=0;c<3;++c) {
-        cuDoubleComplex a=arg[p+static_cast<size_t>(c)];
-        if (her) a=cconj_hd(a);
-        cuDoubleComplex r=cadd_hd(a,cmul(cc[3*mat+static_cast<size_t>(c)],slice[static_cast<size_t>(c)*sliceN+index]));
-        if (her) r=cconj_hd(r);
-        result[p+static_cast<size_t>(c)]=r;
-    }
-}
+/* spectralMultiplySliceBatchKernel moved to kernel.cu */
 
-__global__ void qmrMultKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                              cuDoubleComplex c, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cmul(c,b[i]);
-}
 
-__global__ void qmrMultSelfKernel(cuDoubleComplex *a, cuDoubleComplex c, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cmul(c,a[i]);
-}
+/* planeToSliceBatchKernel moved to kernel.cu */
 
-__global__ void qmrLinComb1Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                  const cuDoubleComplex *c, cuDoubleComplex c1, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cadd_hd(cmul(c1,b[i]),c[i]);
-}
 
-__global__ void qmrLinCombKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                 const cuDoubleComplex *c, cuDoubleComplex c1,
-                                 cuDoubleComplex c2, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cadd_hd(cmul(c1,b[i]),cmul(c2,c[i]));
-}
+/* gatherSliceKernel moved to kernel.cu */
 
-__global__ void qmrIncrem110Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                   const cuDoubleComplex *c, cuDoubleComplex c1,
-                                   cuDoubleComplex c2, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cadd_hd(cadd_hd(cmul(c1,a[i]),cmul(c2,b[i])),c[i]);
-}
 
-__global__ void qmrIncrem111Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                   const cuDoubleComplex *c, cuDoubleComplex c1,
-                                   cuDoubleComplex c2, cuDoubleComplex c3, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cadd_hd(cadd_hd(cmul(c1,a[i]),cmul(c2,b[i])),cmul(c3,c[i]));
-}
+/* qmrMultKernel moved to kernel.cu */
 
-__global__ void qmrIncrem01Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                  cuDoubleComplex c, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i] = cadd_hd(a[i],cmul(c,b[i]));
-}
 
-__global__ void qmrIncrem11DCKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                    AddaCudaReal c1, cuDoubleComplex c2, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) {
-        const cuDoubleComplex r1 = make_cuDoubleComplex(c1*a[i].x,c1*a[i].y);
-        a[i] = cadd_hd(r1,cmul(c2,b[i]));
-    }
-}
+/* qmrMultSelfKernel moved to kernel.cu */
 
-__global__ void iterCopyKernel(cuDoubleComplex *a, const cuDoubleComplex *b, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i]=b[i];
-}
 
-__global__ void iterIncrem10Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                   cuDoubleComplex c, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i]=cadd_hd(cmul(c,a[i]),b[i]);
-}
+/* qmrLinComb1Kernel moved to kernel.cu */
 
-__global__ void iterIncrem011Kernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                    const cuDoubleComplex *c, cuDoubleComplex c1,
-                                    cuDoubleComplex c2, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i]=cadd_hd(a[i],cadd_hd(cmul(c1,b[i]),cmul(c2,c[i])));
-}
 
-__global__ void iterLinComb1ConjKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                       const cuDoubleComplex *c, cuDoubleComplex c1, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i]=cadd_hd(cmul(c1,cconj_hd(b[i])),c[i]);
-}
+/* qmrLinCombKernel moved to kernel.cu */
 
-__global__ void iterIncrem110DCConjKernel(cuDoubleComplex *a, const cuDoubleComplex *b,
-                                          const cuDoubleComplex *c, AddaCudaReal c1,
-                                          cuDoubleComplex c2, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) {
-        const cuDoubleComplex ca=cconj_hd(a[i]);
-        const cuDoubleComplex r1=make_cuDoubleComplex(c1*ca.x,c1*ca.y);
-        a[i]=cadd_hd(cadd_hd(r1,cmul(c2,cconj_hd(b[i]))),c[i]);
-    }
-}
 
-__global__ void iterMultSelfConjKernel(cuDoubleComplex *a, AddaCudaReal c, size_t n)
-{
-    const size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
-    if (i < n) a[i]=make_cuDoubleComplex(c*a[i].x,-c*a[i].y);
-}
+/* qmrIncrem110Kernel moved to kernel.cu */
+
+
+/* qmrIncrem111Kernel moved to kernel.cu */
+
+
+/* qmrIncrem01Kernel moved to kernel.cu */
+
+
+/* qmrIncrem11DCKernel moved to kernel.cu */
+
+
+/* iterCopyKernel moved to kernel.cu */
+
+
+/* iterIncrem10Kernel moved to kernel.cu */
+
+
+/* iterIncrem011Kernel moved to kernel.cu */
+
+
+/* iterLinComb1ConjKernel moved to kernel.cu */
+
+
+/* iterIncrem110DCConjKernel moved to kernel.cu */
+
+
+/* iterMultSelfConjKernel moved to kernel.cu */
+
 
 int launchChecked(const char *name)
 {
@@ -1072,31 +623,11 @@ int launchChecked(const char *name)
 #ifdef ADDA_CUDA_SINGLE_BACKEND
 static const size_t ADDA_FP64_REDUCTION_CHUNK = static_cast<size_t>(1) << 20; /* 1,048,576 */
 
-__global__ void convertComplexF32ToF64Kernel(const cuFloatComplex *src,
-                                             AddaCudaDoubleComplex *dst,
-                                             size_t n)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if (i<n) {
-        dst[i].x=static_cast<double>(src[i].x);
-        dst[i].y=static_cast<double>(src[i].y);
-    }
-}
+/* convertComplexF32ToF64Kernel moved to kernel.cu */
 
-__global__ void convertComplexPairF32ToF64Kernel(const cuFloatComplex *src_a,
-                                                 const cuFloatComplex *src_b,
-                                                 AddaCudaDoubleComplex *dst_a,
-                                                 AddaCudaDoubleComplex *dst_b,
-                                                 size_t n)
-{
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
-    if (i<n) {
-        dst_a[i].x=static_cast<double>(src_a[i].x);
-        dst_a[i].y=static_cast<double>(src_a[i].y);
-        dst_b[i].x=static_cast<double>(src_b[i].x);
-        dst_b[i].y=static_cast<double>(src_b[i].y);
-    }
-}
+
+/* convertComplexPairF32ToF64Kernel moved to kernel.cu */
+
 
 int convertReductionChunk(const cuDoubleComplex *src,AddaCudaDoubleComplex *dst,
                           size_t count,const char *what)
@@ -1108,7 +639,7 @@ int convertReductionChunk(const cuDoubleComplex *src,AddaCudaDoubleComplex *dst,
         setError("FP64 reduction conversion launch exceeds CUDA grid limit");
         return -1;
     }
-    convertComplexF32ToF64Kernel<<<static_cast<unsigned int>(b),threads>>>(
+    adda_kernel_convertComplexF32ToF64Kernel(static_cast<unsigned int>(b),threads,
         reinterpret_cast<const cuFloatComplex*>(src),dst,count);
     return launchChecked(what);
 }
@@ -1124,7 +655,7 @@ int convertReductionPairChunk(const cuDoubleComplex *src_a,const cuDoubleComplex
         setError("FP64 pair-conversion launch exceeds CUDA grid limit");
         return -1;
     }
-    convertComplexPairF32ToF64Kernel<<<static_cast<unsigned int>(blocks),threads>>>(
+    adda_kernel_convertComplexPairF32ToF64Kernel(static_cast<unsigned int>(blocks),threads,
         reinterpret_cast<const cuFloatComplex*>(src_a),
         reinterpret_cast<const cuFloatComplex*>(src_b),
         dst_a,dst_b,count);
@@ -1669,7 +1200,7 @@ int matvecGpuCoreSlice(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, 
                  "clear CUDA slice Z workspace")) return -1;
     const int threads=256;
     const unsigned int dipBlocks=static_cast<unsigned int>((g.cfg.ndip+threads-1)/threads);
-    scatterSliceKernel<<<dipBlocks,threads>>>(d_arg,g.d_slice,g.d_material,g.d_position,g.d_cc,
+    adda_kernel_scatterSliceKernel(dipBlocks,threads,d_arg,g.d_slice,g.d_material,g.d_position,g.d_cc,
                                               g.cfg.ndip,g.boxX,g.boxY,g.sliceN,her!=0);
     if (failCuda(cudaGetLastError(),"scatterSliceKernel launch")) return -1;
     for (int c=0;c<3;++c) {
@@ -1683,7 +1214,7 @@ int matvecGpuCoreSlice(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, 
         const size_t remaining=g.cfg.gridZ-kz0;
         const size_t active=(remaining<static_cast<size_t>(ADDA_CUDA_SLICE_BATCH))
                           ? remaining : static_cast<size_t>(ADDA_CUDA_SLICE_BATCH);
-        sliceToPlaneBatchKernel<<<planeBatchBlocks,threads>>>(g.d_slice,g.d_plane,kz0,active,
+        adda_kernel_sliceToPlaneBatchKernel(planeBatchBlocks,threads,g.d_slice,g.d_plane,kz0,active,
             g.boxX,g.boxY,g.cfg.gridX,g.boxXY,g.sliceN,g.planeN);
         if (failCuda(cudaGetLastError(),"sliceToPlaneBatchKernel launch")) return -1;
         if (failCufft(cufftExecZ2Z(g.planXY,reinterpret_cast<cufftDoubleComplex*>(g.d_plane),
@@ -1691,7 +1222,7 @@ int matvecGpuCoreSlice(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, 
                       "cufftExecZ2Z(slice XY batch forward)")) return -1;
         const size_t activePlaneN=active*g.planeN;
         const unsigned int activePlaneBlocks=static_cast<unsigned int>((activePlaneN+threads-1)/threads);
-        spectralMultiplySliceBatchKernel<<<activePlaneBlocks,threads>>>(g.d_plane,g.d_D,kz0,active,
+        adda_kernel_spectralMultiplySliceBatchKernel(activePlaneBlocks,threads,g.d_plane,g.d_D,kz0,active,
             g.cfg.gridX,g.cfg.gridY,g.cfg.gridZ,g.planeN,g.DsizeX,g.cfg.DsizeY,g.cfg.DsizeZ,
             g.cfg.reduced_fft,transposed,g.low_mem_green ? 1 : 0);
         if (failCuda(cudaGetLastError(),"spectralMultiplySliceBatchKernel launch")) return -1;
@@ -1700,7 +1231,7 @@ int matvecGpuCoreSlice(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, 
                       "cufftExecZ2Z(slice XY batch inverse)")) return -1;
         const size_t activeBoxN=active*g.boxXY;
         const unsigned int activeBoxBlocks=static_cast<unsigned int>((activeBoxN+threads-1)/threads);
-        planeToSliceBatchKernel<<<activeBoxBlocks,threads>>>(g.d_plane,g.d_slice,kz0,active,
+        adda_kernel_planeToSliceBatchKernel(activeBoxBlocks,threads,g.d_plane,g.d_slice,kz0,active,
             g.boxX,g.cfg.gridX,g.boxXY,g.sliceN,g.planeN);
         if (failCuda(cudaGetLastError(),"planeToSliceBatchKernel launch")) return -1;
     }
@@ -1708,11 +1239,11 @@ int matvecGpuCoreSlice(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, 
         cufftDoubleComplex *ptr=reinterpret_cast<cufftDoubleComplex*>(g.d_slice+static_cast<size_t>(c)*g.sliceN);
         if (failCufft(cufftExecZ2Z(g.planZ,ptr,ptr,CUFFT_INVERSE),"cufftExecZ2Z(slice Z inverse)")) return -1;
     }
-    gatherSliceKernel<<<dipBlocks,threads>>>(d_arg,d_result,g.d_slice,g.d_material,g.d_position,g.d_cc,
+    adda_kernel_gatherSliceKernel(dipBlocks,threads,d_arg,d_result,g.d_slice,g.d_material,g.d_position,g.d_cc,
                                              g.cfg.ndip,g.boxX,g.boxY,g.sliceN,her!=0);
     if (failCuda(cudaGetLastError(),"gatherSliceKernel launch")) return -1;
     if (g.project_material>=0) {
-        materialProjectionKernel<<<dipBlocks,threads>>>(d_result,g.d_material,g.cfg.ndip,g.project_material);
+        adda_kernel_materialProjectionKernel(dipBlocks,threads,d_result,g.d_material,g.cfg.ndip,g.project_material);
         if (failCuda(cudaGetLastError(),"materialProjectionKernel(slice) launch")) return -1;
     }
     if (inprod != nullptr) {
@@ -1739,7 +1270,7 @@ int matvecGpuCore(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, int h
 
     const int threads = 256;
     const unsigned int dipBlocks = static_cast<unsigned int>((g.cfg.ndip + threads - 1)/threads);
-    scatterKernel<<<dipBlocks,threads>>>(d_arg,g.d_grid,g.d_material,g.d_position,g.d_cc,
+    adda_kernel_scatterKernel(dipBlocks,threads,d_arg,g.d_grid,g.d_material,g.d_position,g.d_cc,
                                         g.cfg.ndip,g.cfg.gridX,g.cfg.gridY,g.gridN,her != 0);
     if (failCuda(cudaGetLastError(),"scatterKernel launch")) return -1;
 
@@ -1753,7 +1284,7 @@ int matvecGpuCore(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, int h
 
     const unsigned int gridBlocks = static_cast<unsigned int>((g.gridN + threads - 1)/threads);
     const int transposed = (!g.cfg.reduced_fft && her) ? 1 : 0;
-    spectralMultiplyKernel<<<gridBlocks,threads>>>(g.d_grid,g.d_gridR,g.d_D,g.d_R,
+    adda_kernel_spectralMultiplyKernel(gridBlocks,threads,g.d_grid,g.d_gridR,g.d_D,g.d_R,
                                                    g.cfg.gridX,g.cfg.gridY,g.cfg.gridZ,g.gridN,
                                                    g.cfg.DsizeY,g.cfg.DsizeZ,g.cfg.RsizeY,
                                                    g.cfg.reduced_fft,transposed,g.cfg.surface);
@@ -1765,11 +1296,11 @@ int matvecGpuCore(const cuDoubleComplex *d_arg, cuDoubleComplex *d_result, int h
                                CUFFT_INVERSE),
                   "cufftExecZ2Z(3D inverse)")) return -1;
 
-    gatherKernel<<<dipBlocks,threads>>>(d_arg,d_result,g.d_grid,g.d_material,g.d_position,g.d_cc,
+    adda_kernel_gatherKernel(dipBlocks,threads,d_arg,d_result,g.d_grid,g.d_material,g.d_position,g.d_cc,
                                        g.cfg.ndip,g.cfg.gridX,g.cfg.gridY,g.gridN,her != 0);
     if (failCuda(cudaGetLastError(),"gatherKernel launch")) return -1;
     if (g.project_material>=0) {
-        materialProjectionKernel<<<dipBlocks,threads>>>(d_result,g.d_material,g.cfg.ndip,g.project_material);
+        adda_kernel_materialProjectionKernel(dipBlocks,threads,d_result,g.d_material,g.cfg.ndip,g.project_material);
         if (failCuda(cudaGetLastError(),"materialProjectionKernel(full) launch")) return -1;
     }
 
@@ -1838,11 +1369,11 @@ static int lanierApplyDeviceMode(const cuDoubleComplex *src,cuDoubleComplex *dst
     const int threads=256;
     const unsigned int db=static_cast<unsigned int>((g.cfg.ndip+threads-1)/threads);
     if(full_mode)
-        lanierFullBoxScatterKernel<<<db,threads>>>(src,g.d_lanier_grid,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
+        adda_kernel_lanierFullBoxScatterKernel(db,threads,src,g.d_lanier_grid,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
                                                    g.lanier_nx,g.lanier_ny,g.lanierN,g.lanier_full_sqrt_dipvol,
                                                    g.lanier_active_material,g.lanier_origin_x,g.lanier_origin_y,g.lanier_origin_z);
     else
-        lanierBoxScatterKernel<<<db,threads>>>(src,g.d_lanier_grid,g.d_position,g.cfg.ndip,
+        adda_kernel_lanierBoxScatterKernel(db,threads,src,g.d_lanier_grid,g.d_position,g.cfg.ndip,
                                                g.lanier_nx,g.lanier_ny,g.lanierN);
     if(launchChecked(full_mode ? "lanierFullBoxScatterKernel" : "lanierBoxScatterKernel")) return -1;
     if(failCufft(cufftExecZ2Z(g.planLanier3d,
@@ -1850,7 +1381,7 @@ static int lanierApplyDeviceMode(const cuDoubleComplex *src,cuDoubleComplex *dst
                               reinterpret_cast<cufftDoubleComplex*>(g.d_lanier_grid),CUFFT_FORWARD),
                  full_mode ? "cufftExecZ2Z(Lanier full forward)" : "cufftExecZ2Z(Lanier reference forward)")) return -1;
     const unsigned int gb=static_cast<unsigned int>((g.lanierN+threads-1)/threads);
-    lanierReducedMultiplyKernel<<<gb,threads>>>(g.d_lanier_grid,g.d_lanier_coeff,
+    adda_kernel_lanierReducedMultiplyKernel(gb,threads,g.d_lanier_grid,g.d_lanier_coeff,
         g.lanier_nx,g.lanier_ny,g.lanier_nz,g.lanierN,
         g.lanier_rx,g.lanier_ry,g.lanier_rz,g.lanierNred);
     if(launchChecked("lanierReducedMultiplyKernel")) return -1;
@@ -1859,11 +1390,11 @@ static int lanierApplyDeviceMode(const cuDoubleComplex *src,cuDoubleComplex *dst
                               reinterpret_cast<cufftDoubleComplex*>(g.d_lanier_grid),CUFFT_INVERSE),
                  full_mode ? "cufftExecZ2Z(Lanier full inverse)" : "cufftExecZ2Z(Lanier reference inverse)")) return -1;
     if(full_mode)
-        lanierFullBoxGatherKernel<<<db,threads>>>(g.d_lanier_grid,dst,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
+        adda_kernel_lanierFullBoxGatherKernel(db,threads,g.d_lanier_grid,dst,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
                                                   g.lanier_nx,g.lanier_ny,g.lanierN,g.lanier_full_sqrt_dipvol,
                                                   g.lanier_active_material,g.lanier_origin_x,g.lanier_origin_y,g.lanier_origin_z);
     else
-        lanierBoxGatherKernel<<<db,threads>>>(g.d_lanier_grid,dst,g.d_position,g.cfg.ndip,
+        adda_kernel_lanierBoxGatherKernel(db,threads,g.d_lanier_grid,dst,g.d_position,g.cfg.ndip,
                                               g.lanier_nx,g.lanier_ny,g.lanierN);
     return launchChecked(full_mode ? "lanierFullBoxGatherKernel" : "lanierBoxGatherKernel");
 }
@@ -1931,20 +1462,20 @@ static int nestedSlotApplyDevice(NestedLanierState &st,const cuDoubleComplex *sr
                 "clear Lanier multizone shared FFT grid"))return -1;
     const int threads=256;
     const unsigned int db=static_cast<unsigned int>((g.cfg.ndip+threads-1)/threads);
-    lanierFullBoxScatterKernel<<<db,threads>>>(src,grid,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
+    adda_kernel_lanierFullBoxScatterKernel(db,threads,src,grid,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
         st.nx,st.ny,st.n,g.lanier_full_sqrt_dipvol,st.active_material,st.origin_x,st.origin_y,st.origin_z);
     if(launchChecked("lanierNestedBoxScatterKernel"))return -1;
     if(failCufft(cufftExecZ2Z(st.plan,reinterpret_cast<cufftDoubleComplex*>(grid),
                               reinterpret_cast<cufftDoubleComplex*>(grid),CUFFT_FORWARD),
                  "cufftExecZ2Z(Lanier nested forward)"))return -1;
     const unsigned int gb=static_cast<unsigned int>((st.n+threads-1)/threads);
-    lanierReducedMultiplyKernel<<<gb,threads>>>(grid,st.coeff,st.nx,st.ny,st.nz,st.n,
+    adda_kernel_lanierReducedMultiplyKernel(gb,threads,grid,st.coeff,st.nx,st.ny,st.nz,st.n,
                                                 st.rx,st.ry,st.rz,st.nred);
     if(launchChecked("lanierNestedReducedMultiplyKernel"))return -1;
     if(failCufft(cufftExecZ2Z(st.plan,reinterpret_cast<cufftDoubleComplex*>(grid),
                               reinterpret_cast<cufftDoubleComplex*>(grid),CUFFT_INVERSE),
                  "cufftExecZ2Z(Lanier nested inverse)"))return -1;
-    lanierFullBoxGatherKernel<<<db,threads>>>(grid,dst,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
+    adda_kernel_lanierFullBoxGatherKernel(db,threads,grid,dst,g.d_position,g.d_material,g.d_cc,g.cfg.ndip,
         st.nx,st.ny,st.n,g.lanier_full_sqrt_dipvol,st.active_material,st.origin_x,st.origin_y,st.origin_z);
     return launchChecked("lanierNestedBoxGatherKernel");
 }
@@ -1968,7 +1499,7 @@ static int nestedApplyDevice(const cuDoubleComplex *src,cuDoubleComplex *dst)
     const cuDoubleComplex one=make_cuDoubleComplex(static_cast<AddaCudaReal>(1),static_cast<AddaCudaReal>(0));
     for(int ns=1;ns<g.nested_count;ns++) {
         if(nestedSlotApplyDevice(g.nested[ns],input,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,one,g.cfg.nrows);
         if(launchChecked("Lanier nested block accumulation"))return -1;
     }
     return 0;
@@ -2006,13 +1537,13 @@ static int schwarzApplyDevice(const cuDoubleComplex *src,cuDoubleComplex *dst)
     for(int ns=0;ns<g.nested_count;ns++) {
         /* tmp2 = M_i P_i^{-1} M_i r_{i-1}. */
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,one,g.cfg.nrows);
         if(launchChecked("Lanier Schwarz correction accumulation"))return -1;
 
         /* No residual update is needed after the last block. */
         if(ns+1<g.nested_count) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier Schwarz residual update"))return -1;
         }
     }
@@ -2044,11 +1575,11 @@ static int schwarzAxpyDevice(cuDoubleComplex *dst,const cuDoubleComplex *src,cuD
     const cuDoubleComplex minus_one=make_cuDoubleComplex(static_cast<AddaCudaReal>(-1),static_cast<AddaCudaReal>(0));
     for(int ns=0;ns<g.nested_count;ns++) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
         if(launchChecked("Lanier Schwarz physical-solution update"))return -1;
         if(ns+1<g.nested_count) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier Schwarz axpy residual update"))return -1;
         }
     }
@@ -2081,12 +1612,12 @@ static int schwarzReverseApplyDevice(const cuDoubleComplex *src,cuDoubleComplex 
 
     for(int ns=g.nested_count-1;ns>=0;ns--) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,one,g.cfg.nrows);
         if(launchChecked("Lanier reverse Schwarz correction accumulation"))return -1;
         /* beta!=0 needs the exact post-sweep residual, including the last zone. */
         if(ns>0 || beta!=0.0) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier reverse Schwarz residual update"))return -1;
         }
     }
@@ -2096,7 +1627,7 @@ static int schwarzReverseApplyDevice(const cuDoubleComplex *src,cuDoubleComplex 
          * a global residual post-correction; no extra persistent vector. */
         if(nestedApplyDevice(g.d_nested_tmp1,g.d_lanier_tmp))return -1;
         const cuDoubleComplex b=make_cuDoubleComplex(static_cast<AddaCudaReal>(beta),static_cast<AddaCudaReal>(0));
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_lanier_tmp,b,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_lanier_tmp,b,g.cfg.nrows);
         if(launchChecked("Lanier reverse Schwarz global residual post-correction"))return -1;
     }
     return 0;
@@ -2125,11 +1656,11 @@ static int schwarzReverseAxpyDevice(cuDoubleComplex *dst,const cuDoubleComplex *
     const cuDoubleComplex minus_one=make_cuDoubleComplex(static_cast<AddaCudaReal>(-1),static_cast<AddaCudaReal>(0));
     for(int ns=g.nested_count-1;ns>=0;ns--) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
         if(launchChecked("Lanier reverse Schwarz physical-solution update"))return -1;
         if(ns>0 || beta!=0.0) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier reverse Schwarz axpy residual update"))return -1;
         }
     }
@@ -2137,7 +1668,7 @@ static int schwarzReverseAxpyDevice(cuDoubleComplex *dst,const cuDoubleComplex *
         if(nestedApplyDevice(g.d_nested_tmp1,g.d_lanier_tmp))return -1;
         const cuDoubleComplex alpha_beta=make_cuDoubleComplex(
             static_cast<AddaCudaReal>(alpha.x*beta),static_cast<AddaCudaReal>(alpha.y*beta));
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_lanier_tmp,alpha_beta,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_lanier_tmp,alpha_beta,g.cfg.nrows);
         if(launchChecked("Lanier reverse Schwarz global physical-solution update"))return -1;
     }
     return 0;
@@ -2198,7 +1729,7 @@ static int schurProjectInPlace(cuDoubleComplex *v,int active_material,const char
 {
     const int threads=256;
     const unsigned int dipBlocks=static_cast<unsigned int>((g.cfg.ndip+threads-1)/threads);
-    materialProjectionKernel<<<dipBlocks,threads>>>(v,g.d_material,g.cfg.ndip,active_material);
+    adda_kernel_materialProjectionKernel(dipBlocks,threads,v,g.d_material,g.cfg.ndip,active_material);
     return launchChecked(label);
 }
 
@@ -2235,7 +1766,7 @@ static int schurEffectiveInverseDevice(int ns,const cuDoubleComplex *src,cuDoubl
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
     const cuDoubleComplex omega=make_cuDoubleComplex(static_cast<AddaCudaReal>(g.schur_omega),
                                                        static_cast<AddaCudaReal>(0));
-    qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp1,omega,g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp1,omega,g.cfg.nrows);
     return launchChecked("Lanier Schur damped effective-diagonal correction");
 }
 
@@ -2271,10 +1802,10 @@ static int schurApplyDevice(const cuDoubleComplex *src,cuDoubleComplex *dst)
         if(matvecGpuCore(g.d_nested_tmp1,g.d_nested_tmp2,0,nullptr,nullptr))return -1;
         if(failCuda(cudaMemcpy(g.d_nested_tmp1,input,bytes,cudaMemcpyDeviceToDevice),
                     "restore Lanier Schur forward rhs"))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_nested_tmp2,minus_one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_nested_tmp2,minus_one,g.cfg.nrows);
         if(launchChecked("Lanier Schur forward reduced rhs"))return -1;
         if(schurEffectiveInverseDevice(ns,g.d_nested_tmp1,g.d_schur_corr))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_schur_corr,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_schur_corr,one,g.cfg.nrows);
         if(launchChecked("Lanier Schur forward block accumulation"))return -1;
     }
 
@@ -2285,7 +1816,7 @@ static int schurApplyDevice(const cuDoubleComplex *src,cuDoubleComplex *dst)
                               "copy Lanier Schur next backward zone"))return -1;
         if(matvecGpuCore(g.d_nested_tmp1,g.d_nested_tmp2,0,nullptr,nullptr))return -1;
         if(schurEffectiveInverseDevice(ns,g.d_nested_tmp2,g.d_schur_corr))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_schur_corr,minus_one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_schur_corr,minus_one,g.cfg.nrows);
         if(launchChecked("Lanier Schur backward substitution"))return -1;
     }
     return 0;
@@ -2308,7 +1839,7 @@ static int schurAxpyDevice(cuDoubleComplex *dst,const cuDoubleComplex *src,cuDou
     if(schurApplyDevice(src,g.d_schur_input))return -1;
     const int threads=256;
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
-    qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_schur_input,alpha,g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_schur_input,alpha,g.cfg.nrows);
     return launchChecked("Lanier Schur physical-solution update");
 }
 
@@ -2341,20 +1872,20 @@ static int schwarzSymApplyDevice(const cuDoubleComplex *src,cuDoubleComplex *dst
 
     for(int ns=0;ns<g.nested_count;ns++) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,one,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz forward correction accumulation"))return -1;
         if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz forward residual update"))return -1;
     }
 
     for(int ns=g.nested_count-2;ns>=0;ns--) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,one,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz backward correction accumulation"))return -1;
         if(ns>0) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier symmetric Schwarz backward residual update"))return -1;
         }
     }
@@ -2385,19 +1916,19 @@ static int schwarzSymAxpyDevice(cuDoubleComplex *dst,const cuDoubleComplex *src,
 
     for(int ns=0;ns<g.nested_count;ns++) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz forward physical-solution update"))return -1;
         if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz forward axpy residual update"))return -1;
     }
     for(int ns=g.nested_count-2;ns>=0;ns--) {
         if(nestedSlotApplyDevice(g.nested[ns],g.d_nested_tmp1,g.d_nested_tmp2))return -1;
-        qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
+        adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_nested_tmp2,alpha,g.cfg.nrows);
         if(launchChecked("Lanier symmetric Schwarz backward physical-solution update"))return -1;
         if(ns>0) {
             if(matvecGpuCore(g.d_nested_tmp2,g.d_lanier_tmp,0,nullptr,nullptr))return -1;
-            qmrIncrem01Kernel<<<blocks,threads>>>(g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
+            adda_kernel_qmrIncrem01Kernel(blocks,threads,g.d_nested_tmp1,g.d_lanier_tmp,minus_one,g.cfg.nrows);
             if(launchChecked("Lanier symmetric Schwarz backward axpy residual update"))return -1;
         }
     }
@@ -2433,7 +1964,7 @@ static int lanierConjugateSelf(cuDoubleComplex *v,const char *label)
 {
     const int threads=256;
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
-    iterMultSelfConjKernel<<<blocks,threads>>>(v,static_cast<AddaCudaReal>(1),g.cfg.nrows);
+    adda_kernel_iterMultSelfConjKernel(blocks,threads,v,static_cast<AddaCudaReal>(1),g.cfg.nrows);
     return launchChecked(label);
 }
 
@@ -2556,7 +2087,7 @@ extern "C" int adda_cuda_lanier_axpy(const void *dst_id,const void *src_id,doubl
     const int threads=256;
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
     const cuDoubleComplex alpha=make_cuDoubleComplex(static_cast<AddaCudaReal>(ar),static_cast<AddaCudaReal>(ai));
-    qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
     return launchChecked("Lanier reference solution axpy");
 }
 
@@ -2629,7 +2160,7 @@ extern "C" int adda_cuda_lanier_full_axpy(const void *dst_id,const void *src_id,
     const int threads=256;
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
     const cuDoubleComplex alpha=make_cuDoubleComplex(static_cast<AddaCudaReal>(ar),static_cast<AddaCudaReal>(ai));
-    qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
     return launchChecked("Lanier full solution axpy");
 }
 extern "C" int adda_cuda_lanier_nested_init_slot(int slot,int active_material,
@@ -2729,7 +2260,7 @@ extern "C" int adda_cuda_lanier_nested_axpy(const void *dst_id,const void *src_i
     const int threads=256;
     const unsigned int blocks=static_cast<unsigned int>((g.cfg.nrows+threads-1)/threads);
     const cuDoubleComplex alpha=make_cuDoubleComplex(static_cast<AddaCudaReal>(ar),static_cast<AddaCudaReal>(ai));
-    qmrIncrem01Kernel<<<blocks,threads>>>(dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,threads,dst,g.d_lanier_tmp,alpha,g.cfg.nrows);
     return launchChecked("Lanier nested solution axpy");
 }
 extern "C" int adda_cuda_lanier_schwarz_apply(const void *src_id,const void *dst_id)
@@ -3112,7 +2643,7 @@ extern "C" int adda_cuda_iter_copy(const void *a_id,const void *b_id)
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterCopyKernel<<<blocks,256>>>(a,b,g.cfg.nrows);
+    adda_kernel_iterCopyKernel(blocks,256,a,b,g.cfg.nrows);
     return launchChecked("iterCopyKernel launch");
 }
 
@@ -3121,7 +2652,7 @@ extern "C" int adda_cuda_iter_mult(const void *a_id,const void *b_id,double cr,d
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrMultKernel<<<blocks,256>>>(a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
+    adda_kernel_qmrMultKernel(blocks,256,a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
     return launchChecked("iterMultKernel launch");
 }
 
@@ -3129,7 +2660,7 @@ extern "C" int adda_cuda_iter_mult_self(const void *a_id,double cr,double ci)
 {
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrMultSelfKernel<<<blocks,256>>>(a,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
+    adda_kernel_qmrMultSelfKernel(blocks,256,a,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
     return launchChecked("iterMultSelfKernel launch");
 }
 
@@ -3137,7 +2668,7 @@ extern "C" int adda_cuda_iter_mult_self_conj(const void *a_id,double c)
 {
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterMultSelfConjKernel<<<blocks,256>>>(a,c,g.cfg.nrows);
+    adda_kernel_iterMultSelfConjKernel(blocks,256,a,c,g.cfg.nrows);
     return launchChecked("iterMultSelfConjKernel launch");
 }
 
@@ -3148,7 +2679,7 @@ extern "C" int adda_cuda_iter_lincomb1(const void *a_id,const void *b_id,const v
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrLinComb1Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),g.cfg.nrows);
+    adda_kernel_qmrLinComb1Kernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),g.cfg.nrows);
     if (launchChecked("iterLinComb1Kernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterLinComb1)");
 }
@@ -3160,7 +2691,7 @@ extern "C" int adda_cuda_iter_lincomb(const void *a_id,const void *b_id,const vo
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrLinCombKernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
+    adda_kernel_qmrLinCombKernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
     if (launchChecked("iterLinCombKernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterLinComb)");
 }
@@ -3172,7 +2703,7 @@ extern "C" int adda_cuda_iter_lincomb1_conj(const void *a_id,const void *b_id,co
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterLinComb1ConjKernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),g.cfg.nrows);
+    adda_kernel_iterLinComb1ConjKernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),g.cfg.nrows);
     if (launchChecked("iterLinComb1ConjKernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterLinComb1Conj)");
 }
@@ -3182,7 +2713,7 @@ extern "C" int adda_cuda_iter_increm01(const void *a_id,const void *b_id,double 
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrIncrem01Kernel<<<blocks,256>>>(a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
+    adda_kernel_qmrIncrem01Kernel(blocks,256,a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
     if (launchChecked("iterIncrem01Kernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterIncrem01)");
 }
@@ -3192,7 +2723,7 @@ extern "C" int adda_cuda_iter_increm10(const void *a_id,const void *b_id,double 
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterIncrem10Kernel<<<blocks,256>>>(a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
+    adda_kernel_iterIncrem10Kernel(blocks,256,a,b,make_cuDoubleComplex(cr,ci),g.cfg.nrows);
     if (launchChecked("iterIncrem10Kernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterIncrem10)");
 }
@@ -3204,7 +2735,7 @@ extern "C" int adda_cuda_iter_increm011(const void *a_id,const void *b_id,const 
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterIncrem011Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
+    adda_kernel_iterIncrem011Kernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
     if (launchChecked("iterIncrem011Kernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterIncrem011)");
 }
@@ -3216,7 +2747,7 @@ extern "C" int adda_cuda_iter_increm110(const void *a_id,const void *b_id,const 
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrIncrem110Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
+    adda_kernel_qmrIncrem110Kernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
     return launchChecked("iterIncrem110Kernel launch");
 }
 
@@ -3227,7 +2758,7 @@ extern "C" int adda_cuda_iter_increm111(const void *a_id,const void *b_id,const 
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrIncrem111Kernel<<<blocks,256>>>(a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),
+    adda_kernel_qmrIncrem111Kernel(blocks,256,a,b,c,make_cuDoubleComplex(c1r,c1i),make_cuDoubleComplex(c2r,c2i),
                                       make_cuDoubleComplex(c3r,c3i),g.cfg.nrows);
     return launchChecked("iterIncrem111Kernel launch");
 }
@@ -3238,7 +2769,7 @@ extern "C" int adda_cuda_iter_increm11_d_c(const void *a_id,const void *b_id,dou
     g_error[0]='\0'; cuDoubleComplex *a=iterDeviceVector(a_id); if(!a)return -1;
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    qmrIncrem11DCKernel<<<blocks,256>>>(a,b,c1,make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
+    adda_kernel_qmrIncrem11DCKernel(blocks,256,a,b,c1,make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
     if (launchChecked("iterIncrem11DCKernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterIncrem11D_C)");
 }
@@ -3250,7 +2781,7 @@ extern "C" int adda_cuda_iter_increm110_d_c_conj(const void *a_id,const void *b_
     cuDoubleComplex *b=iterDeviceVector(b_id); if(!b)return -1;
     cuDoubleComplex *c=iterDeviceVector(c_id); if(!c)return -1;
     unsigned int blocks; if(iterBlocks(&blocks))return -1;
-    iterIncrem110DCConjKernel<<<blocks,256>>>(a,b,c,c1,make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
+    adda_kernel_iterIncrem110DCConjKernel(blocks,256,a,b,c,c1,make_cuDoubleComplex(c2r,c2i),g.cfg.nrows);
     if (launchChecked("iterIncrem110DCConjKernel launch")) return -1;
     return iterNorm2(a,norm2,"cublasDznrm2(iterIncrem110D_C_Conj)");
 }

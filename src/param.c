@@ -297,6 +297,9 @@ static const struct subopt_struct shape_opt[]={
 		"x2,y2,z2 (upper one, second domain).",5,SH_BIELLIPSOID},
 	{"bisphere","<R_cc/d> ","Two identical spheres with diameter d and center-to-center distance R_cc (along the "
 		"z-axis). It describe both separate and sintered spheres.",1,SH_BISPHERE},
+	{"bisphere2","<R_cc/d>","Two separated identical spheres with diameter d and center-to-center distance R_cc "
+		"(along z). The lower sphere is the first material domain and the upper sphere is the second; R_cc/d must be >1. "
+		"This validation geometry is intended for -precon lanier_partition.",1,SH_BISPHERE2},
 	{"box","[<y/x> <z/x>]","Homogeneous cube (if no arguments are given) or a rectangular parallelepiped with edges "
 		"x,y,z.",UNDEF,SH_BOX},
 	{"capsule","<h/d>","Homogeneous capsule (cylinder with half-spherical end caps) with cylinder height h and "
@@ -417,6 +420,7 @@ PARSE_FUNC(opt);
 PARSE_FUNC(orient);
 PARSE_FUNC(phi_integr);
 PARSE_FUNC(pol);
+PARSE_FUNC(precon);
 PARSE_FUNC(prognosis);
 PARSE_FUNC(prop);
 PARSE_FUNC(recalc_resid);
@@ -571,9 +575,9 @@ static struct opt_struct options[]={
 		 * !!! If subarguments are added, second-to-last argument should be changed from 1 to UNDEF, and consistency
 		 * test for number of arguments should be implemented in PARSE_FUNC(int_surf) below.
 		 */
-	{PAR(iter),"{bcgs2|bicg|bicgstab|bicgstab2|bicgstab4|cgnr|csym|gpbicgstab2|gpbicgstab4|qmr|qmr2}","Sets the iterative solver.\n"
+	{PAR(iter),"{bcgs2|bicg|bicgstab|bicgstab2|bicgstab4|bicgstab8|bicgstab12|cgnr|csym|gpbicgstab2|gpbicgstab4|qmr|qmr2}","Sets the iterative solver.\n"
 		"'bicgstab2' is an alias for ADDA's enhanced BCGS2 implementation (BiCGStab(l) with l=2).\n"
-		"'bicgstab4' and 'gpbicgstab4' are available in CPU and CUDA builds; CUDA keeps all large L=4 vectors GPU-resident.\n"
+		"'bicgstab4', 'bicgstab8', 'bicgstab12', and 'gpbicgstab4' are available in CPU and CUDA builds; CUDA keeps all large L vectors GPU-resident.\n"
 		"Default: qmr",1,NULL},
 		/* TO ADD NEW ITERATIVE SOLVER
 		 * add the short name, used to define the new iterative solver in the command line, to the list "{...}" in the
@@ -639,6 +643,14 @@ static struct opt_struct options[]={
 		 * Modify string constants after 'PAR(pol)': add new argument (possibly with additional sub-arguments) to list
 		 * {...} and its description to the next string.
 		 */
+	{PAR(precon),"{none|lanier|lanier1x|lanier15x|lanier1.5x|lanier_full|lanier_tqc|lanier_partition|lanier_part|lanier_nested|lanier_core_shell|lanier_multizone|lanier_mz|lanier_multizone_schwarz|lanier_mz_schwarz|lanier_schwarz|lanier_multizone_schwarz_sym|lanier_mz_schwarz_sym|lanier_schwarz_sym|lanier_multizone_schwarz_reverse|lanier_mz_schwarz_reverse|lanier_schwarz_reverse|lanier_multizone_schur|lanier_mz_schur|lanier_schur}","Selects an iterative-solver preconditioner. 'none' keeps the "
+		"original ADDA operator. 'lanier' and 'lanier1x' use the validated homogeneous three-level Chan/Lanier "
+		"reference 1x circulant. 'lanier15x' (alias 'lanier1.5x') uses the same construction on an independent "
+		"auxiliary grid ceil(1.5*box), rounded upward to even FFT lengths. 'lanier_full' (alias 'lanier_tqc') is the TQC-v1 FULL6 "
+		"single-conditioner path. 'lanier_partition' (alias 'lanier_part') implements the article-style separated-material "
+		"partition sweep: one FULL6 conditioner per material region, local solves with the selected -iter method, back-and-forth scattered-field "
+		"exchange with warm starts, then a full-system solve initialized by the combined partition solution. Touching material "
+		"regions are rejected because this mode is for separated objects. 'lanier_nested' (alias 'lanier_core_shell') is the two-domain core-shell/contact block-Jacobi mode. 'lanier_multizone' (alias 'lanier_mz') generalizes the same strict-mask FULL6 block-Jacobi operator to every occupied ADDA domain (2..60 zones); repeated optical indices are allowed, so several ADDA domains may represent the same physical material. 'lanier_multizone_schwarz' (aliases 'lanier_mz_schwarz' and 'lanier_schwarz') applies a forward multiplicative Schwarz sweep. 'lanier_multizone_schwarz_sym' (aliases 'lanier_mz_schwarz_sym' and 'lanier_schwarz_sym') applies a forward sweep followed by the reverse sweep. 'lanier_multizone_schwarz_reverse' (aliases 'lanier_mz_schwarz_reverse' and 'lanier_schwarz_reverse') applies the same multiplicative recurrence in descending ADDA-domain order. 'lanier_multizone_schur' (aliases 'lanier_mz_schur' and 'lanier_schur') applies a nearest-neighbor approximate Schur-LDU chain: each regional FULL6 inverse receives one interface-feedback Schur correction and adjacent zones are coupled by an explicit forward/backward block solve. Exact global ADDA MatVec calls generate every interface action. Schwarz modes and Schur V2.1 support bcgs2, bicgstab, bicgstab4, gpbicgstab2, and gpbicgstab4. The global Krylov MatVec always retains exact cross-zone coupling. Default: none",1,NULL},
 	{PAR(prognosis),"","Do not actually perform simulation (not even memory allocation) but only estimate the required "
 		"RAM. Implies '-test'.",0,NULL},
 	{PAR(prop),"<x> <y> <z>","Sets propagation direction of incident radiation, float. Normalization (to the unity "
@@ -1348,6 +1360,8 @@ PARSE_FUNC(iter)
 	else if (strcmp(argv[1],"bicgstab")==0) IterMethod=IT_BICGSTAB;
 	else if (strcmp(argv[1],"bicgstab2")==0) IterMethod=IT_BCGS2;
 	else if (strcmp(argv[1],"bicgstab4")==0 || strcmp(argv[1],"bicgstabl4")==0) IterMethod=IT_BICGSTAB4;
+	else if (strcmp(argv[1],"bicgstab8")==0 || strcmp(argv[1],"bicgstabl8")==0) IterMethod=IT_BICGSTAB8;
+	else if (strcmp(argv[1],"bicgstab12")==0 || strcmp(argv[1],"bicgstabl12")==0) IterMethod=IT_BICGSTAB12;
 	else if (strcmp(argv[1],"cgnr")==0) IterMethod=IT_CGNR;
 	else if (strcmp(argv[1],"csym")==0) IterMethod=IT_CSYM;
 	else if (strcmp(argv[1],"gpbicgstab2")==0 || strcmp(argv[1],"gpbicgstabl2")==0) IterMethod=IT_GPBICGSTAB2;
@@ -1481,6 +1495,146 @@ PARSE_FUNC(pol)
 	else NotSupported("Polarizability relation",argv[1]);
 	TestExtraNarg(Narg,noExtraArgs,argv[1]);
 }
+PARSE_FUNC(precon)
+{
+	if (strcmp(argv[1],"none")==0) {
+		lanier_precon=false;
+		lanier_full_precon=false;
+		lanier_partition_precon=false;
+		lanier_nested_precon=false;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.0;
+	}
+	else if (strcmp(argv[1],"lanier")==0 || strcmp(argv[1],"lanier1x")==0) {
+		lanier_precon=true;
+		lanier_full_precon=false;
+		lanier_partition_precon=false;
+		lanier_nested_precon=false;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.0;
+	}
+	else if (strcmp(argv[1],"lanier15x")==0 || strcmp(argv[1],"lanier1.5x")==0) {
+		lanier_precon=true;
+		lanier_full_precon=false;
+		lanier_partition_precon=false;
+		lanier_nested_precon=false;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_full")==0 || strcmp(argv[1],"lanier_tqc")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true;
+		lanier_partition_precon=false;
+		lanier_nested_precon=false;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5; /* archive TQC-v1 direct construction */
+	}
+	else if (strcmp(argv[1],"lanier_partition")==0 || strcmp(argv[1],"lanier_part")==0) {
+		lanier_precon=false; /* local FULL6 conditioners are enabled internally */
+		lanier_full_precon=false;
+		lanier_partition_precon=true;
+		lanier_nested_precon=false;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_nested")==0 || strcmp(argv[1],"lanier_core_shell")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true; /* regional blocks use FULL6 and inherit all-solver/reset logic */
+		lanier_partition_precon=false;
+		lanier_nested_precon=true;
+		lanier_multizone_precon=false;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_multizone")==0 || strcmp(argv[1],"lanier_mz")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true; /* each zone uses its own FULL6 block */
+		lanier_partition_precon=false;
+		lanier_nested_precon=true; /* reuse the generic strict-mask block backend */
+		lanier_multizone_precon=true;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_multizone_schwarz")==0 || strcmp(argv[1],"lanier_mz_schwarz")==0 ||
+	         strcmp(argv[1],"lanier_schwarz")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true; /* each zone uses its own FULL6 block */
+		lanier_partition_precon=false;
+		lanier_nested_precon=true; /* reuse the generic strict-mask regional backend */
+		lanier_multizone_precon=true;
+		lanier_multizone_schwarz_precon=true;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_multizone_schwarz_sym")==0 || strcmp(argv[1],"lanier_mz_schwarz_sym")==0 ||
+	         strcmp(argv[1],"lanier_schwarz_sym")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true; /* each zone uses its own FULL6 block */
+		lanier_partition_precon=false;
+		lanier_nested_precon=true; /* reuse the generic strict-mask regional backend */
+		lanier_multizone_precon=true;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=true;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_multizone_schwarz_reverse")==0 || strcmp(argv[1],"lanier_mz_schwarz_reverse")==0 ||
+	         strcmp(argv[1],"lanier_schwarz_reverse")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true;
+		lanier_partition_precon=false;
+		lanier_nested_precon=true;
+		lanier_multizone_precon=true;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=true;
+		lanier_multizone_schur_precon=false;
+		lanier_expansion=1.5;
+	}
+	else if (strcmp(argv[1],"lanier_multizone_schur")==0 || strcmp(argv[1],"lanier_mz_schur")==0 ||
+	         strcmp(argv[1],"lanier_schur")==0) {
+		lanier_precon=true;
+		lanier_full_precon=true;
+		lanier_partition_precon=false;
+		lanier_nested_precon=true;
+		lanier_multizone_precon=true;
+		lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=true;
+		lanier_expansion=1.5;
+	}
+	else NotSupported("Preconditioner",argv[1]);
+}
 PARSE_FUNC(prognosis)
 {
 	prognosis=true;
@@ -1612,11 +1766,11 @@ PARSE_FUNC(shape)
 		// either parse filename or parse all parameters as float; consistency is checked later
 		if (!ScanFnamesError(Narg,need,argv+2,&shape_fname,NULL)) {
 			// This should never happen if proper correspondence is kept between MAX_N_SH_PARMS and MAX_NMAT
-			if (Narg>MAX_N_SH_PARMS) 
+			if (Narg>MAX_N_SH_PARMS)
 				PrintError("Insufficient MAX_N_SH_PARMS=%d for parsing %d shape arguments",MAX_N_SH_PARMS,Narg);
 			for (j=0;j<Narg;j++) ScanDoubleError(argv[j+2],sh_pars+j);
 		}
-		if (shape==SH_COATED2) 
+		if (shape==SH_COATED2)
 			LogWarning(EC_WARN,ONE_POS,"'-shape coated2 ...' is deprecated, use '-shape onion ...' instead");
 		// stop search
 		found=true;
@@ -2086,6 +2240,18 @@ void InitVariables(void)
 	recalc_resid=false;
 	reliable_resid=false;
 	reliable_resid_force_restart=false;
+	lanier_precon=false;
+	lanier_full_precon=false;
+	lanier_partition_precon=false;
+	lanier_nested_precon=false;
+	lanier_multizone_precon=false;
+	lanier_multizone_schwarz_precon=false;
+		lanier_multizone_schwarz_sym_precon=false;
+		lanier_multizone_schwarz_reverse_precon=false;
+		lanier_multizone_schur_precon=false;
+	lanier_partition_local_mode=false;
+	lanier_partition_active_material=-1;
+	lanier_expansion=1.0;
 	surface=false;
 	msubInf=false;
 	ReflRelation=(enum refl)UNDEF;
@@ -2198,7 +2364,7 @@ void VariablesInterconnect(void)
 	/* TO ADD NEW INTERACTION FORMULATION
 	 * If the new Green's tensor is non-symmetric (which is very unlikely) add it to the test above (now redundant)
 	 */
-	
+
 	if (deprecated_bc_used && beam_center_used) LogError(ONE_POS,"Beam center coordinates can not be specified as "
 		"arguments to both '-beam' and '-beam_center'. Use only the latter.");
 	if (calc_Csca || calc_vec) all_dir = true;
@@ -2686,6 +2852,8 @@ void PrintInfo(void)
 			case IT_BICG_CS: fprintf(logfile,"Bi-CG (complex symmetric)\n"); break;
 			case IT_BICGSTAB: fprintf(logfile,"Bi-CG Stabilized\n"); break;
 			case IT_BICGSTAB4: fprintf(logfile,"BiCGStab(4)\n"); break;
+			case IT_BICGSTAB8: fprintf(logfile,"BiCGStab(8)\n"); break;
+			case IT_BICGSTAB12: fprintf(logfile,"BiCGStab(12)\n"); break;
 			case IT_CGNR: fprintf(logfile,"CGNR\n"); break;
 			case IT_CSYM: fprintf(logfile,"CSYM\n"); break;
 			case IT_GPBICGSTAB2: fprintf(logfile,"GPBiCGStab(2)\n"); break;

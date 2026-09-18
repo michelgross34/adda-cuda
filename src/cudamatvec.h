@@ -21,6 +21,38 @@ void MatVec_GPU(doublecomplex * restrict argvec,
                 TIME_TYPE *timing,
                 TIME_TYPE *comm_timing);
 
+/* Lanier CUDA preconditioner integration. The validated reference 1x/1.5x
+ * modes remain BCGS2-only. LANIER_FULL, LANIER_NESTED, and additive
+ * LANIER_MULTIZONE retain the all-solver integration. LANIER_MULTIZONE_SCHWARZ, LANIER_MULTIZONE_SCHWARZ_REVERSE, LANIER_MULTIZONE_SCHWARZ_SYM, and LANIER_MULTIZONE_SCHUR
+ * V1 are restricted to the supported right-preconditioned nonsymmetric solvers.
+ * All modes are available in the CUDA executable variants; slice/low-memory
+ * physical MatVec modes still use independent full 3-D auxiliary FFTs for the
+ * Lanier blocks. */
+void CudaLanierInit(void);
+void CudaLanierRelease(void);
+/* LANIER_PARTITION_V2: restrict physical MatVec rows to one material.
+ * Pass -1 to restore the complete physical operator. */
+void CudaLanierPartitionProjection(int material_id);
+void CudaLanierMatVec(doublecomplex * restrict argvec,
+                      doublecomplex * restrict resultvec,
+                      double *inprod,
+                      bool her,
+                      TIME_TYPE *timing,
+                      TIME_TYPE *comm_timing);
+/* Direct P application, used for residual-space conversion of the
+ * complex-symmetric Krylov family. src==dst is supported. */
+void CudaLanierApply(doublecomplex *src,doublecomplex *dst);
+/* Congruence operator P*A*P. Since both A and P are complex symmetric, this
+ * preserves the matrix symmetry required by BiCG_CS/CSYM/QMR_CS. */
+void CudaLanierMatVecCongruence(doublecomplex * restrict argvec,
+                                doublecomplex * restrict resultvec,
+                                double *inprod,
+                                TIME_TYPE *timing,
+                                TIME_TYPE *comm_timing);
+void CudaLanierAxpy(doublecomplex * restrict dst,
+                    const doublecomplex * restrict src,
+                    double complex alpha);
+
 /* Resident-vector lifecycle for any current iterative solver. `method` is an
  * enum iter value, accepted as int here to keep this header independent of
  * const.h include ordering. */
